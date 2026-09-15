@@ -1,13 +1,14 @@
 #import "WaveEngine.h"
 #import "WaveTable.h"
 #import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <math.h>
 
-static NSString * const kKeyPos  = @"wave26.pos";
-static NSString * const kKeyPosX = @"wave26.posx";
-static NSString * const kKeyPosY = @"wave26.posy";
+static NSString * const kKeyPos   = @"wave26.pos";
+static NSString * const kKeyPosX  = @"wave26.posx";
+static NSString * const kKeyPosY  = @"wave26.posy";
 static NSString * const kKeyScale = @"wave26.scale";
-static NSString * const kKeyDock = @"wave26.dock";
+static NSString * const kKeyDock  = @"wave26.dock";
 
 static const CGFloat kSpringMass = 1.5;
 
@@ -50,45 +51,50 @@ static const CGFloat kSpringMass = 1.5;
 }
 
 - (void)playWithPullVelocity:(double)pullVelocity {
-    /*
-     * Reconstructed from the original arm64 binary.
-     *
-     * The original performs a preprocessing pass that finds the two
-     * wave-1 icons at row 3, columns 1 and 2. When both exist, it gives
-     * every wave-1 icon a homeOverrideX and enables horizontalFly.
-     */
     UIScreen *screen = [UIScreen mainScreen];
-    CGFloat screenMidX = CGRectGetMidX(screen.bounds);
+    CGRect bounds = screen.bounds;
+    CGFloat screenMidX = CGRectGetMidX(bounds);
 
-    WaveIcon *leftWaveIcon = nil;
-    WaveIcon *rightWaveIcon = nil;
+    WaveIcon *col1Row3 = nil;
+    WaveIcon *col2Row3 = nil;
 
+    /*
+     * First pass in the original binary:
+     * find wave 1 icons specifically at row 3, columns 1 and 2.
+     */
     for (WaveIcon *icon in self.icons) {
-        NSInteger wave = [WaveTable waveForCol:icon.col row:icon.row];
+        if ([WaveTable waveForCol:icon.col row:icon.row] != 1) {
+            continue;
+        }
+        if (!icon.view) {
+            continue;
+        }
+        if (icon.row != 3) {
+            continue;
+        }
 
-        if (wave == 1 && icon.row == 3) {
-            if (icon.col == 1) {
-                leftWaveIcon = icon;
-            } else if (icon.col == 2) {
-                rightWaveIcon = icon;
-            }
+        if (icon.col == 1) {
+            col1Row3 = icon;
+        } else if (icon.col == 2) {
+            col2Row3 = icon;
         }
     }
 
+    /*
+     * When both reference icons exist, the original binary derives a
+     * half horizontal spacing from their actual layer positions and uses
+     * the screen midpoint as the anchor for wave-1 horizontal flight.
+     */
     CGFloat halfDeltaX = 0.0;
 
-    if (leftWaveIcon && rightWaveIcon) {
-        UIView *leftView = leftWaveIcon.view;
-        UIView *rightView = rightWaveIcon.view;
+    if (col1Row3 && col2Row3) {
+        CALayer *leftLayer = col1Row3.view.layer;
+        CALayer *rightLayer = col2Row3.view.layer;
 
-        if (leftView && rightView) {
-            halfDeltaX = (leftView.layer.position.x - rightView.layer.position.x) * 0.5;
+        if (leftLayer && rightLayer) {
+            halfDeltaX =
+                (leftLayer.position.x - rightLayer.position.x) * 0.5;
 
-            /*
-             * This intentionally preserves the direction recovered from
-             * the original binary: col 1 receives midX - halfDeltaX and
-             * col 2 receives midX + halfDeltaX.
-             */
             for (WaveIcon *icon in self.icons) {
                 if ([WaveTable waveForCol:icon.col row:icon.row] != 1) {
                     continue;
@@ -102,7 +108,7 @@ static const CGFloat kSpringMass = 1.5;
 
                 if (icon.col == 1) {
                     icon.homeOverrideX = screenMidX - halfDeltaX;
-                } else if (icon.col == 2) {
+                } else {
                     icon.homeOverrideX = screenMidX + halfDeltaX;
                 }
 
@@ -112,30 +118,36 @@ static const CGFloat kSpringMass = 1.5;
     }
 
     /*
-     * Binary calls animateIcon for every registered icon and passes the
-     * WaveTable delay using a 0.055 wave interval.
+     * Second pass: the original uses WaveTable's 0.055 wave interval.
      */
     for (WaveIcon *icon in self.icons) {
-        double delay = [WaveTable delayForCol:icon.col
-                                         row:icon.row
-                                waveInterval:0.055];
-        [self animateIcon:icon delay:delay pullVelocity:pullVelocity];
+        double delay =
+            [WaveTable delayForCol:icon.col
+                               row:icon.row
+                     waveInterval:0.055];
+
+        [self animateIcon:icon
+                     delay:delay
+              pullVelocity:pullVelocity];
     }
 
     [self animateDock:pullVelocity];
 }
 
-- (double)dampingForIcon:(WaveIcon *)icon pullVelocity:(double)pullVelocity {
+- (double)dampingForIcon:(WaveIcon *)icon
+            pullVelocity:(double)pullVelocity {
     NSInteger wave = [WaveTable waveForCol:icon.col row:icon.row];
 
     double normalized = fabs(pullVelocity) / 2500.0;
-    normalized = MIN(1.0, normalized);
-
-    if (wave >= 1 && wave <= 3) {
-        return -8.0 * normalized + 42.0;
+    if (normalized > 1.0) {
+        normalized = 1.0;
     }
 
-    return -2.1 * normalized + 26.0;
+    if (wave >= 1 && wave <= 3) {
+        return 42.0 - 8.0 * normalized;
+    }
+
+    return 26.0 - 2.1 * normalized;
 }
 
 - (double)stiffnessForIcon:(WaveIcon *)icon {
@@ -163,7 +175,8 @@ static const CGFloat kSpringMass = 1.5;
         return;
     }
 
-    double damping = [self dampingForIcon:icon pullVelocity:pullVelocity];
+    double damping = [self dampingForIcon:icon
+                             pullVelocity:pullVelocity];
     double stiffness = [self stiffnessForIcon:icon];
     double initialVelocity = [self initialVelocityForIcon:icon];
 
@@ -173,28 +186,19 @@ static const CGFloat kSpringMass = 1.5;
         original.x = icon.homeOverrideX;
     }
 
-    /*
-     * Binary special-case: row 5 is moved behind other layers.
-     */
     if (icon.row == 5) {
         layer.zPosition = -1.0;
     }
 
-    UIScreen *screen = [UIScreen mainScreen];
-    CGPoint center = CGPointMake(CGRectGetMidX(screen.bounds),
-                                 CGRectGetMidY(screen.bounds));
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+    CGPoint screenCenter =
+        CGPointMake(CGRectGetMidX(screenBounds),
+                    CGRectGetMidY(screenBounds));
 
-    /*
-     * Vector from screen center to the icon.
-     */
-    CGFloat dx = original.x - center.x;
-    CGFloat dy = original.y - center.y;
+    CGFloat dx = original.x - screenCenter.x;
+    CGFloat dy = original.y - screenCenter.y;
     CGFloat distance = hypot(dx, dy);
 
-    /*
-     * Binary threshold: if distance < 0.0001, force (0, -1) and
-     * distance = 1 to avoid division by zero.
-     */
     if (distance < 0.0001) {
         dx = 0.0;
         dy = -1.0;
@@ -205,48 +209,52 @@ static const CGFloat kSpringMass = 1.5;
     }
 
     /*
-     * Horizontal-fly mode uses an alternate direction/target path.
-     * The recovered binary selects +0.8 for icons on the right side
-     * of the screen and -0.8 for icons on the left, while the vertical
-     * component is normalized by 150.0.
+     * Horizontal-fly branch, recovered literally:
+     * dx = +/-0.8 according to the horizontal side,
+     * dy = (original.y - screenCenter.y) / 150.
+     *
+     * These values are used only to form the normal target branch;
+     * the horizontal-fly target below uses the screen center directly.
      */
     if (icon.horizontalFly) {
-        dx = (original.x >= center.x) ? 0.8 : -0.8;
-        dy = (original.y - center.y) / 150.0;
+        dx = (original.x >= screenCenter.x) ? 0.8 : -0.8;
+        dy = (original.y - screenCenter.y) / 150.0;
     }
 
     /*
-     * The scale/stretch factor recovered from the binary:
+     * IMPORTANT: the scale factor is based on WaveTable.center(), not
+     * the physical screen center.
      *
-     *   factor = min(1, distance / 3)
-     *   stretch = 4.5 + 2.1 * (1 - factor)
+     * Grid center = (1.5, 2.0).
      */
-    double factor = MIN(1.0, distance / 3.0);
-    double stretch = 4.5 + 2.1 * (1.0 - factor);
+    CGPoint tableCenter = [WaveTable center];
+    CGFloat gridX = (CGFloat)icon.col + 0.5 - tableCenter.x;
+    CGFloat gridY = (CGFloat)icon.row + 0.5 - tableCenter.y;
 
-    CGPoint toPoint;
+    CGFloat gridDistance = hypot(gridX, gridY);
+
+    double factor = gridDistance / 3.0;
+    if (factor > 1.0) {
+        factor = 1.0;
+    }
+
+    double stretch =
+        4.5 + 2.1 * (1.0 - factor);
+
+    CGPoint target;
 
     if (icon.horizontalFly) {
-        /*
-         * Horizontal-fly target:
-         *   center + (original - center) * stretch
-         *
-         * (dx/dy above are still kept because they are part of the
-         * original control flow, although this target branch does not
-         * use them directly.)
-         */
-        (void)dx;
-        (void)dy;
-
-        toPoint = CGPointMake(center.x + (original.x - center.x) * stretch,
-                              center.y + (original.y - center.y) * stretch);
+        target = CGPointMake(
+            screenCenter.x +
+                (original.x - screenCenter.x) * stretch,
+            screenCenter.y +
+                (original.y - screenCenter.y) * stretch
+        );
     } else {
-        /*
-         * Normal target:
-         *   original + normalizedDirection * 800
-         */
-        toPoint = CGPointMake(original.x + dx * 800.0,
-                              original.y + dy * 800.0);
+        target = CGPointMake(
+            original.x + dx * 800.0,
+            original.y + dy * 800.0
+        );
     }
 
     CFTimeInterval beginTime =
@@ -256,7 +264,7 @@ static const CGFloat kSpringMass = 1.5;
         [CASpringAnimation animationWithKeyPath:@"position"];
 
     position.fromValue = [NSValue valueWithCGPoint:original];
-    position.toValue = [NSValue valueWithCGPoint:toPoint];
+    position.toValue = [NSValue valueWithCGPoint:target];
     position.damping = damping;
     position.stiffness = stiffness;
     position.mass = kSpringMass;
@@ -271,15 +279,12 @@ static const CGFloat kSpringMass = 1.5;
     CASpringAnimation *scale =
         [CASpringAnimation animationWithKeyPath:@"transform.scale"];
 
-    /*
-     * Binary uses stretch -> 1.0, not 1.0 -> 1.0.
-     */
     scale.fromValue = @(stretch);
     scale.toValue = @1.0;
     scale.damping = damping;
     scale.stiffness = stiffness;
     scale.mass = kSpringMass;
-    scale.initialVelocity = 0.0;
+    scale.initialVelocity = initialVelocity;
     scale.duration = scale.settlingDuration;
     scale.beginTime = beginTime;
     scale.fillMode = kCAFillModeBackwards;
@@ -299,11 +304,8 @@ static const CGFloat kSpringMass = 1.5;
     }
 
     CGPoint original = layer.position;
-
-    /*
-     * Binary target is exactly +380 points on Y.
-     */
-    CGPoint toPoint = CGPointMake(original.x, original.y + 380.0);
+    CGPoint target =
+        CGPointMake(original.x, original.y + 380.0);
 
     CFTimeInterval beginTime =
         [layer convertTime:CACurrentMediaTime() fromLayer:nil];
@@ -312,7 +314,7 @@ static const CGFloat kSpringMass = 1.5;
         [CASpringAnimation animationWithKeyPath:@"position"];
 
     animation.fromValue = [NSValue valueWithCGPoint:original];
-    animation.toValue = [NSValue valueWithCGPoint:toPoint];
+    animation.toValue = [NSValue valueWithCGPoint:target];
     animation.damping = 22.0;
     animation.stiffness = 115.0;
     animation.mass = 1.5;
