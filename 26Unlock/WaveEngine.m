@@ -3,7 +3,6 @@
 #import <QuartzCore/QuartzCore.h>
 
 static const CGFloat kSpringMass = 1.5;
-static const CGFloat kSpringDamping = 22.0;
 static const CGFloat kSpringStiffness = 115.0;
 static const CGFloat kSpringVelocity = 0.015;
 
