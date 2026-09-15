@@ -100,7 +100,6 @@ static NSString * const kKeyDock = @"wave26.dock";
     CGPoint original = layer.position;
     CGFloat centerX = [WaveTable center].x;
 
-    NSInteger wave = [WaveTable waveForCol:icon.col row:icon.row];
     CGFloat horizontal = (icon.col < centerX) ? -1.0 : 1.0;
     CGFloat amplitude = 14.0 + MIN(20.0, fabs(pullVelocity) * 0.01);
     CGFloat dx = horizontal * amplitude;
