@@ -92,8 +92,11 @@ static const CGFloat kSpringMass = 1.5;
         CALayer *rightLayer = col2Row3.view.layer;
 
         if (leftLayer && rightLayer) {
+            // FIX (binary: (col2.x - col1.x) * 0.5, i.e. positive).
+            // The old order produced a negative half-spacing and mirrored the
+            // wave-1 icons around the screen centre.
             halfDeltaX =
-                (leftLayer.position.x - rightLayer.position.x) * 0.5;
+                (rightLayer.position.x - leftLayer.position.x) * 0.5;
 
             for (WaveIcon *icon in self.icons) {
                 if ([WaveTable waveForCol:icon.col row:icon.row] != 1) {
@@ -153,8 +156,10 @@ static const CGFloat kSpringMass = 1.5;
 - (double)stiffnessForIcon:(WaveIcon *)icon {
     NSInteger wave = [WaveTable waveForCol:icon.col row:icon.row];
 
+    // FIX: the binary uses 300.0 for waves 1..3 (150.0 is only the dy
+    // divisor inside -animateIcon:). 150.0 made the centre icons too soft.
     if (wave >= 1 && wave <= 3) {
-        return 150.0;
+        return 300.0;
     }
 
     return 115.0;
@@ -225,7 +230,7 @@ static const CGFloat kSpringMass = 1.5;
      * IMPORTANT: the scale factor is based on WaveTable.center(), not
      * the physical screen center.
      *
-     * Grid center = (1.5, 2.0).
+     * Grid centre = (1.5, 2.5)  [verified in the binary: fmov d0,#1.5 / fmov d1,#2.5].
      */
     CGPoint tableCenter = [WaveTable center];
     CGFloat gridX = (CGFloat)icon.col + 0.5 - tableCenter.x;
@@ -263,8 +268,11 @@ static const CGFloat kSpringMass = 1.5;
     CASpringAnimation *position =
         [CASpringAnimation animationWithKeyPath:@"position"];
 
-    position.fromValue = [NSValue valueWithCGPoint:original];
-    position.toValue = [NSValue valueWithCGPoint:target];
+    // FIX (main bug): the binary animates FROM the far target TO the home
+    // position.  The swapped order sent every icon ~800 pt outward and let it
+    // snap back - the "icons stuck at the wrong position / jitter" symptom.
+    position.fromValue = [NSValue valueWithCGPoint:target];
+    position.toValue = [NSValue valueWithCGPoint:original];
     position.damping = damping;
     position.stiffness = stiffness;
     position.mass = kSpringMass;

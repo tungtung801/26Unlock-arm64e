@@ -12,7 +12,7 @@ static const NSInteger kWaveMap[6][4] = {
 @implementation WaveTable
 
 + (CGPoint)center {
-    return CGPointMake(1.5, 2.0);
+    return CGPointMake(1.5, 2.5);
 }
 
 + (BOOL)isValidCol:(NSInteger)col row:(NSInteger)row {

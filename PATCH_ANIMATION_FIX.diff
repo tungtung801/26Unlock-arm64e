@@ -1,0 +1,225 @@
+diff --git a/26Unlock/Tweak.xm b/26Unlock/Tweak.xm
+index 9a3c848..59f7bee 100644
+--- a/26Unlock/Tweak.xm
++++ b/26Unlock/Tweak.xm
+@@ -124,7 +124,8 @@ static void wave26_fire(void) {
+     for (UIView *view in icons) wave26_stripAncestors(view);
+     if (dock) wave26_stripAncestors(dock);
+ 
+-    double velocity = g_haveLastVel ? g_lastVel.y : 0.0;
++    // FIX: the binary falls back to -1250.0, not 0.0.
++    double velocity = g_haveLastVel ? g_lastVel.y : -1250.0;
+     [g_engine playWithPullVelocity:velocity];
+ }
+ 
+@@ -151,17 +152,55 @@ static void wave26_registerHome(NSArray *icons, UIView *dock) {
+     if (icons.count == 0) return;
+     [g_engine setDockView:dock];
+ 
+-    // The original enumerates icon views and maps them into a 4 x 6 wave table.
+-    NSInteger index = 0;
+-    for (UIView *view in icons) {
+-        NSInteger col = index % 4;
+-        NSInteger row = MIN(index / 4, 5);
+-        if (isInDock(view, dock)) {
+-            index++;
+-            continue;
+-        }
++    // FIX: the original never uses the array index.  It converts every icon
++    // frame to WINDOW coordinates, drops invalid ones, takes the bounding box
++    // of the remaining icon CENTRES and derives
++    //     col = clamp((midX - minX) / (MAX(1, maxX - minX) / 4), 0, 3)
++    //     row = clamp((midY - minY) / (MAX(1, maxY - minY) / 6), 0, 5)
++    // (division truncates towards zero, then clamps).  The /4 and /6 overshoot
++    // by one cell on the last column/row - the clamp pins them back to 3 / 5.
++    NSMutableArray *ordered = [NSMutableArray array];
++    NSMutableArray *centres = [NSMutableArray array];
++
++    double minX = INFINITY, maxX = -INFINITY;
++    double minY = INFINITY, maxY = -INFINITY;
++
++    for (id item in icons) {
++        if (![item isKindOfClass:[UIView class]]) continue;
++        UIView *view = (UIView *)item;
++        if (dock && isInDock(view, dock)) continue;
++
++        CGRect frame = [view convertRect:view.bounds toView:nil];
++        if (CGRectIsNull(frame) || CGRectIsEmpty(frame)) continue;
++
++        double midX = CGRectGetMidX(frame);
++        double midY = CGRectGetMidY(frame);
++
++        [ordered addObject:view];
++        [centres addObject:[NSValue valueWithCGPoint:CGPointMake(midX, midY)]];
++
++        if (midX < minX) minX = midX;
++        if (midX > maxX) maxX = midX;
++        if (midY < minY) minY = midY;
++        if (midY > maxY) maxY = midY;
++    }
++
++    if (ordered.count == 0) return;
++
++    double cellW = MAX(1.0, maxX - minX) / 4.0;
++    double cellH = MAX(1.0, maxY - minY) / 6.0;
++
++    for (NSUInteger i = 0; i < ordered.count; i++) {
++        UIView *view = ordered[i];
++        CGPoint centre = [centres[i] CGPointValue];
++
++        NSInteger col = (NSInteger)((centre.x - minX) / cellW);
++        NSInteger row = (NSInteger)((centre.y - minY) / cellH);
++
++        if (col < 0) col = 0; else if (col > 3) col = 3;
++        if (row < 0) row = 0; else if (row > 5) row = 5;
++
+         [g_engine registerIcon:view col:col row:row];
+-        index++;
+     }
+ }
+ 
+diff --git a/26Unlock/WaveEngine.m b/26Unlock/WaveEngine.m
+index a1bca16..672a5fc 100644
+--- a/26Unlock/WaveEngine.m
++++ b/26Unlock/WaveEngine.m
+@@ -92,8 +92,11 @@ static const CGFloat kSpringMass = 1.5;
+         CALayer *rightLayer = col2Row3.view.layer;
+ 
+         if (leftLayer && rightLayer) {
++            // FIX (binary: (col2.x - col1.x) * 0.5, i.e. positive).
++            // The old order produced a negative half-spacing and mirrored the
++            // wave-1 icons around the screen centre.
+             halfDeltaX =
+-                (leftLayer.position.x - rightLayer.position.x) * 0.5;
++                (rightLayer.position.x - leftLayer.position.x) * 0.5;
+ 
+             for (WaveIcon *icon in self.icons) {
+                 if ([WaveTable waveForCol:icon.col row:icon.row] != 1) {
+@@ -153,8 +156,10 @@ static const CGFloat kSpringMass = 1.5;
+ - (double)stiffnessForIcon:(WaveIcon *)icon {
+     NSInteger wave = [WaveTable waveForCol:icon.col row:icon.row];
+ 
++    // FIX: the binary uses 300.0 for waves 1..3 (150.0 is only the dy
++    // divisor inside -animateIcon:). 150.0 made the centre icons too soft.
+     if (wave >= 1 && wave <= 3) {
+-        return 150.0;
++        return 300.0;
+     }
+ 
+     return 115.0;
+@@ -225,7 +230,7 @@ static const CGFloat kSpringMass = 1.5;
+      * IMPORTANT: the scale factor is based on WaveTable.center(), not
+      * the physical screen center.
+      *
+-     * Grid center = (1.5, 2.0).
++     * Grid centre = (1.5, 2.5)  [verified in the binary: fmov d0,#1.5 / fmov d1,#2.5].
+      */
+     CGPoint tableCenter = [WaveTable center];
+     CGFloat gridX = (CGFloat)icon.col + 0.5 - tableCenter.x;
+@@ -263,8 +268,11 @@ static const CGFloat kSpringMass = 1.5;
+     CASpringAnimation *position =
+         [CASpringAnimation animationWithKeyPath:@"position"];
+ 
+-    position.fromValue = [NSValue valueWithCGPoint:original];
+-    position.toValue = [NSValue valueWithCGPoint:target];
++    // FIX (main bug): the binary animates FROM the far target TO the home
++    // position.  The swapped order sent every icon ~800 pt outward and let it
++    // snap back - the "icons stuck at the wrong position / jitter" symptom.
++    position.fromValue = [NSValue valueWithCGPoint:target];
++    position.toValue = [NSValue valueWithCGPoint:original];
+     position.damping = damping;
+     position.stiffness = stiffness;
+     position.mass = kSpringMass;
+diff --git a/26Unlock/WaveTable.m b/26Unlock/WaveTable.m
+index edec758..fb87de7 100644
+--- a/26Unlock/WaveTable.m
++++ b/26Unlock/WaveTable.m
+@@ -12,7 +12,7 @@ static const NSInteger kWaveMap[6][4] = {
+ @implementation WaveTable
+ 
+ + (CGPoint)center {
+-    return CGPointMake(1.5, 2.0);
++    return CGPointMake(1.5, 2.5);
+ }
+ 
+ + (BOOL)isValidCol:(NSInteger)col row:(NSInteger)row {
+diff --git a/Tweak.xm b/Tweak.xm
+index 9a3c848..59f7bee 100644
+--- a/Tweak.xm
++++ b/Tweak.xm
+@@ -124,7 +124,8 @@ static void wave26_fire(void) {
+     for (UIView *view in icons) wave26_stripAncestors(view);
+     if (dock) wave26_stripAncestors(dock);
+ 
+-    double velocity = g_haveLastVel ? g_lastVel.y : 0.0;
++    // FIX: the binary falls back to -1250.0, not 0.0.
++    double velocity = g_haveLastVel ? g_lastVel.y : -1250.0;
+     [g_engine playWithPullVelocity:velocity];
+ }
+ 
+@@ -151,17 +152,55 @@ static void wave26_registerHome(NSArray *icons, UIView *dock) {
+     if (icons.count == 0) return;
+     [g_engine setDockView:dock];
+ 
+-    // The original enumerates icon views and maps them into a 4 x 6 wave table.
+-    NSInteger index = 0;
+-    for (UIView *view in icons) {
+-        NSInteger col = index % 4;
+-        NSInteger row = MIN(index / 4, 5);
+-        if (isInDock(view, dock)) {
+-            index++;
+-            continue;
+-        }
++    // FIX: the original never uses the array index.  It converts every icon
++    // frame to WINDOW coordinates, drops invalid ones, takes the bounding box
++    // of the remaining icon CENTRES and derives
++    //     col = clamp((midX - minX) / (MAX(1, maxX - minX) / 4), 0, 3)
++    //     row = clamp((midY - minY) / (MAX(1, maxY - minY) / 6), 0, 5)
++    // (division truncates towards zero, then clamps).  The /4 and /6 overshoot
++    // by one cell on the last column/row - the clamp pins them back to 3 / 5.
++    NSMutableArray *ordered = [NSMutableArray array];
++    NSMutableArray *centres = [NSMutableArray array];
++
++    double minX = INFINITY, maxX = -INFINITY;
++    double minY = INFINITY, maxY = -INFINITY;
++
++    for (id item in icons) {
++        if (![item isKindOfClass:[UIView class]]) continue;
++        UIView *view = (UIView *)item;
++        if (dock && isInDock(view, dock)) continue;
++
++        CGRect frame = [view convertRect:view.bounds toView:nil];
++        if (CGRectIsNull(frame) || CGRectIsEmpty(frame)) continue;
++
++        double midX = CGRectGetMidX(frame);
++        double midY = CGRectGetMidY(frame);
++
++        [ordered addObject:view];
++        [centres addObject:[NSValue valueWithCGPoint:CGPointMake(midX, midY)]];
++
++        if (midX < minX) minX = midX;
++        if (midX > maxX) maxX = midX;
++        if (midY < minY) minY = midY;
++        if (midY > maxY) maxY = midY;
++    }
++
++    if (ordered.count == 0) return;
++
++    double cellW = MAX(1.0, maxX - minX) / 4.0;
++    double cellH = MAX(1.0, maxY - minY) / 6.0;
++
++    for (NSUInteger i = 0; i < ordered.count; i++) {
++        UIView *view = ordered[i];
++        CGPoint centre = [centres[i] CGPointValue];
++
++        NSInteger col = (NSInteger)((centre.x - minX) / cellW);
++        NSInteger row = (NSInteger)((centre.y - minY) / cellH);
++
++        if (col < 0) col = 0; else if (col > 3) col = 3;
++        if (row < 0) row = 0; else if (row > 5) row = 5;
++
+         [g_engine registerIcon:view col:col row:row];
+-        index++;
+     }
+ }
+ 

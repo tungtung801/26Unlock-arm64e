@@ -124,7 +124,8 @@ static void wave26_fire(void) {
     for (UIView *view in icons) wave26_stripAncestors(view);
     if (dock) wave26_stripAncestors(dock);
 
-    double velocity = g_haveLastVel ? g_lastVel.y : 0.0;
+    // FIX: the binary falls back to -1250.0, not 0.0.
+    double velocity = g_haveLastVel ? g_lastVel.y : -1250.0;
     [g_engine playWithPullVelocity:velocity];
 }
 
@@ -151,17 +152,55 @@ static void wave26_registerHome(NSArray *icons, UIView *dock) {
     if (icons.count == 0) return;
     [g_engine setDockView:dock];
 
-    // The original enumerates icon views and maps them into a 4 x 6 wave table.
-    NSInteger index = 0;
-    for (UIView *view in icons) {
-        NSInteger col = index % 4;
-        NSInteger row = MIN(index / 4, 5);
-        if (isInDock(view, dock)) {
-            index++;
-            continue;
-        }
+    // FIX: the original never uses the array index.  It converts every icon
+    // frame to WINDOW coordinates, drops invalid ones, takes the bounding box
+    // of the remaining icon CENTRES and derives
+    //     col = clamp((midX - minX) / (MAX(1, maxX - minX) / 4), 0, 3)
+    //     row = clamp((midY - minY) / (MAX(1, maxY - minY) / 6), 0, 5)
+    // (division truncates towards zero, then clamps).  The /4 and /6 overshoot
+    // by one cell on the last column/row - the clamp pins them back to 3 / 5.
+    NSMutableArray *ordered = [NSMutableArray array];
+    NSMutableArray *centres = [NSMutableArray array];
+
+    double minX = INFINITY, maxX = -INFINITY;
+    double minY = INFINITY, maxY = -INFINITY;
+
+    for (id item in icons) {
+        if (![item isKindOfClass:[UIView class]]) continue;
+        UIView *view = (UIView *)item;
+        if (dock && isInDock(view, dock)) continue;
+
+        CGRect frame = [view convertRect:view.bounds toView:nil];
+        if (CGRectIsNull(frame) || CGRectIsEmpty(frame)) continue;
+
+        double midX = CGRectGetMidX(frame);
+        double midY = CGRectGetMidY(frame);
+
+        [ordered addObject:view];
+        [centres addObject:[NSValue valueWithCGPoint:CGPointMake(midX, midY)]];
+
+        if (midX < minX) minX = midX;
+        if (midX > maxX) maxX = midX;
+        if (midY < minY) minY = midY;
+        if (midY > maxY) maxY = midY;
+    }
+
+    if (ordered.count == 0) return;
+
+    double cellW = MAX(1.0, maxX - minX) / 4.0;
+    double cellH = MAX(1.0, maxY - minY) / 6.0;
+
+    for (NSUInteger i = 0; i < ordered.count; i++) {
+        UIView *view = ordered[i];
+        CGPoint centre = [centres[i] CGPointValue];
+
+        NSInteger col = (NSInteger)((centre.x - minX) / cellW);
+        NSInteger row = (NSInteger)((centre.y - minY) / cellH);
+
+        if (col < 0) col = 0; else if (col > 3) col = 3;
+        if (row < 0) row = 0; else if (row > 5) row = 5;
+
         [g_engine registerIcon:view col:col row:row];
-        index++;
     }
 }
 
