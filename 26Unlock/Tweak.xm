@@ -39,7 +39,10 @@ static BOOL isInDock(UIView *view, UIView *dock);
     }
     if (!view) return;
 
-    CGPoint velocity = [self velocityInView:view];
+    CGPoint velocity = CGPointZero;
+    if ([self isKindOfClass:[UIPanGestureRecognizer class]]) {
+        velocity = [(UIPanGestureRecognizer *)self velocityInView:view];
+    }
     g_lastVel = velocity;
     g_haveLastVel = YES;
 
