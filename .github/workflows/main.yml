@@ -1,0 +1,72 @@
+name: Build 26Unlock
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang --version
+
+      - name: Install dependencies
+        run: |
+          brew install ldid
+          brew install make
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          submodules: recursive
+          path: theos
+
+      - name: Build rootless package
+        working-directory: 26Unlock
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Inspect ARM64e binary
+        working-directory: 26Unlock
+        run: |
+          echo "=== Package ==="
+          ls -lah packages/
+
+          echo "=== Dylib ==="
+          find . -name "*.dylib" -print
+
+          echo "=== Mach-O headers ==="
+          find . -name "*.dylib" -exec otool -hv {} \;
+
+          echo "=== CPU subtype ==="
+          find . -name "*.dylib" -exec otool -hv {} \; | grep -E "ARM64|cpusubtype"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 26Unlock-rootless-arm64e
+          path: |
+            26Unlock/packages/*.deb
+            26Unlock/.theos/obj/**/*.dylib
+          if-no-files-found: error
