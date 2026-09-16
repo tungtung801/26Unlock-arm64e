@@ -115,6 +115,8 @@ static const CFTimeInterval kW26PanReFireWindow = 1.5;
 static double g_cfgUnlockDelay = 0.00;  /* delay used on the unlock flow      */
 static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
 static BOOL   g_cfgWaitCover   = YES;   /* wait until the lock screen is gone */
+static BOOL   g_cfgWaitGrid    = YES;   /* wait until the icon grid is at home*/
+static double g_cfgGridMin     = 0.50;  /* min bbox width / screen width      */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
@@ -135,6 +137,10 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgForcePres   = [v boolValue];
     v = [d objectForKey:@"WaitForCoverSheet"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitCover   = [v boolValue];
+    v = [d objectForKey:@"WaitForGrid"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitGrid    = [v boolValue];
+    v = [d objectForKey:@"GridMinWidth"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGridMin     = [v doubleValue];
 }
 
 /* ------------------------------------------------------------------ */
@@ -145,6 +151,7 @@ static BOOL g_fireScheduled;   /* a fire is already pending              */
 static BOOL g_fireDone;        /* a wave already played for this flow    */
 static BOOL g_unlockFlow;      /* cover sheet going away == unlock       */
 static BOOL g_fireRequested;   /* a fire is already queued               */
+static BOOL g_pinPresentation; /* keep progress pinned at 1.0             */
 static CFTimeInterval g_requestedAt; /* when the fire was queued           */
 
 /* Set right before a wave plays: the ancestor scale the wave offsets must be
@@ -152,6 +159,7 @@ static CFTimeInterval g_requestedAt; /* when the fire was queued           */
 double W26ScaleComp = 1.0;
 
 static void   w26_forceHomePresentation(void);
+static BOOL   w26_gridAtHome(NSArray *icons, double *outSpan);
 static double w26_effectiveScale(UIView *view);
 static BOOL   w26_homeSettled(void);
 static void   w26_stripForeign(UIView *view);
@@ -369,8 +377,27 @@ static void w26_fire(double velocity, int attempt) {
         return;
     }
 
+    if (g_cfgWaitGrid) {
+        double span = 0.0;
+        if (!w26_gridAtHome(icons, &span) && attempt < 20) {   /* 20 * 0.05 = 1.0 s */
+            if (attempt == 0) {
+                w26_log(@"grid not at home yet (span=%.0f) - waiting", span);
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                w26_fire(velocity, attempt + 1);
+            });
+            return;
+        }
+    }
+
     g_lastFireTime = now;
     g_fireDone = YES;
+    g_pinPresentation = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        g_pinPresentation = NO;
+    });
 
     w26_log(@"fire: +%.2fs after request, +%.2fs after unlock, +%.2fs after cover sheet gone | "
             @"cfg(delay=%.2f settle=%d scaleComp=%d guard=%.2f)",
@@ -426,6 +453,30 @@ static void w26_fire(double velocity, int attempt) {
 
     w26_log(@"fire: wave played - %lu icons, dock=%@, velocity=%.1f",
             (unsigned long)icons.count, dock ? @"yes" : @"no", velocity);
+}
+
+/* Is the icon grid already laid out at its home positions?  During the unlock
+ * SpringBoard keeps the icons condensed near the middle of the screen until it
+ * finishes presenting; playing the wave then makes every icon fly towards that
+ * clump instead of towards its home, which is the "circle blob" symptom.  No
+ * private API is needed: a condensed grid simply spans far less than the
+ * screen. */
+static BOOL w26_gridAtHome(NSArray *icons, double *outSpan) {
+    if (icons.count < 2) return NO;
+
+    double minX = INFINITY, maxX = -INFINITY;
+    for (UIView *v in icons) {
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        double mx = CGRectGetMidX(f);
+        if (mx < minX) minX = mx;
+        if (mx > maxX) maxX = mx;
+    }
+
+    double span = maxX - minX;
+    double screenW = [UIScreen mainScreen].bounds.size.width;
+    if (outSpan) *outSpan = span;
+
+    return (screenW > 0) && (span >= g_cfgGridMin * screenW);
 }
 
 /* SpringBoard reveals the home screen gradually during the unlock
@@ -683,7 +734,11 @@ static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL an
     if (w26_orig_presentationProgress) {
         void (*orig)(id, SEL, double, BOOL, id) =
             (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
-        orig(self, _cmd, progress, NO, completion);
+        /* While a wave runs the home screen must stay fully presented,
+         * otherwise SpringBoard's per-frame progress values snap the icons
+         * back towards their condensed (pre-unlock) positions and the wave
+         * collapses into a clump. */
+        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO, completion);
     }
 
     if (progress < 1.0 || g_panFired) return;
