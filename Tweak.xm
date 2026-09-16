@@ -131,6 +131,23 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
 }
 
+/* ------------------------------------------------------------------ */
+#pragma mark - flow state / forward declarations
+/* ------------------------------------------------------------------ */
+
+static BOOL g_fireScheduled;   /* a fire is already pending              */
+static BOOL g_fireDone;        /* a wave already played for this flow    */
+static BOOL g_unlockFlow;      /* cover sheet going away == unlock       */
+
+/* Set right before a wave plays: the ancestor scale the wave offsets must be
+ * divided by so the motion keeps its on-screen size.  Read by WaveEngine.m. */
+double W26ScaleComp = 1.0;
+
+static double w26_effectiveScale(UIView *view);
+static BOOL   w26_homeSettled(void);
+static void   w26_stripForeign(UIView *view);
+static void   w26_guardTick(NSArray *icons, int ticksLeft);
+
 /* original implementations */
 static IMP w26_orig_setState;
 static IMP w26_orig_hasAnimatedIconLayoutBefore;
