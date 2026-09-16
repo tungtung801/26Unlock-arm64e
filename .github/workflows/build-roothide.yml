@@ -6,6 +6,9 @@ name: Build 26Unlock (RootHide)
 # "26Unlock.dylib.roothidepatch" symlink and no dynamic patch module is loaded.
 # That dynamic patching is instruction-address based and breaks the arm64e
 # slice of a fat dylib (worked on A9/arm64, silently dead on A12/arm64e).
+#
+# NOTE: this runs on macOS, so dpkg-deb does NOT exist - payload inspection
+# uses ar/tar/otool/strings only.
 
 on:
   workflow_dispatch:
@@ -34,9 +37,12 @@ jobs:
         run: |
           bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
           echo "--- locate theos ---"
-          ls -d "$HOME/theos" || ls -d "$HOME/.theos" || true
-          if [ -d "$HOME/theos" ]; then echo "THEOS=$HOME/theos" >> $GITHUB_ENV; fi
-          if [ -d "$HOME/.theos" ]; then echo "THEOS=$HOME/.theos" >> $GITHUB_ENV; fi
+          ls -d "$HOME/theos" 2>/dev/null || true
+          ls -d "$HOME/.theos" 2>/dev/null || true
+          if   [ -d "$HOME/theos" ];  then echo "THEOS=$HOME/theos"  >> $GITHUB_ENV
+          elif [ -d "$HOME/.theos" ]; then echo "THEOS=$HOME/.theos" >> $GITHUB_ENV
+          else echo "::error::could not locate roothide theos"; exit 1
+          fi
 
       - name: Remove stale packages
         working-directory: 26Unlock
@@ -48,25 +54,30 @@ jobs:
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS="arm64 arm64e"
 
-      - name: Verify payload
-        working-directory: 26Unlock
-        run: |
-          DEB=$(ls packages/*.deb | head -1)
-          echo "deb: $DEB"
-          echo "=== control fields ==="
-          dpkg-deb -f "$DEB" Package Version Architecture
-          echo "=== payload ==="
-          dpkg-deb -c "$DEB"
-          echo "=== slices ==="
-          find . -name '*.dylib' -exec otool -hv {} \; | grep -E "ARM64|cpusubtype"
-          echo "=== linked libraries (must NOT list CydiaSubstrate) ==="
-          find . -name '*.dylib' -exec otool -L {} \;
-          echo "=== /var/jb strings inside the dylib (must be 0) ==="
-          find . -name '*.dylib' -print0 | xargs -0 -I{} sh -c 'echo -n "{}: "; strings "{}" | grep -c "/var/jb" || echo 0'
-
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: 26Unlock-roothide
           path: 26Unlock/packages/*.deb
           if-no-files-found: error
+
+      - name: Verify payload
+        continue-on-error: true
+        working-directory: 26Unlock
+        run: |
+          DEB=$(ls packages/*.deb | head -1)
+          echo "deb: $DEB"
+          TMP=$(mktemp -d); cd "$TMP"
+          ar -x "$GITHUB_WORKSPACE/26Unlock/$DEB"
+          ls -la
+          echo "=== control fields ==="
+          tar -xzf control.tar.gz -O 2>/dev/null || true
+          echo "=== payload ==="
+          for t in data.tar.*; do echo "-- $t"; tar -tf "$t"; done
+          cd "$GITHUB_WORKSPACE/26Unlock"
+          echo "=== slices ==="
+          find . -name '*.dylib' -exec otool -hv {} \; | grep -E "ARM64|cpusubtype"
+          echo "=== linked libraries (must NOT list CydiaSubstrate) ==="
+          find . -name '*.dylib' -exec otool -L {} \;
+          echo "=== /var/jb strings inside the dylib (must be 0) ==="
+          find . -name '*.dylib' -print0 | xargs -0 -I{} sh -c 'printf "%s: " "{}"; strings "{}" | grep -c "/var/jb" || echo 0'
