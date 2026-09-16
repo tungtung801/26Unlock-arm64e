@@ -113,7 +113,7 @@ static const CFTimeInterval kW26PanReFireWindow = 1.5;
 /* Every value below can be changed on device without rebuilding: edit
  * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
 static double g_cfgUnlockDelay = 0.35;  /* delay used on the unlock flow      */
-static BOOL   g_cfgWaitSettle  = NO;    /* wait for the home screen to settle */
+static BOOL   g_cfgWaitSettle  = YES;   /* wait for the home screen to settle */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 
@@ -138,6 +138,7 @@ static void w26_loadSettings(void) {
 static BOOL g_fireScheduled;   /* a fire is already pending              */
 static BOOL g_fireDone;        /* a wave already played for this flow    */
 static BOOL g_unlockFlow;      /* cover sheet going away == unlock       */
+static BOOL g_fireRequested;   /* a fire is already queued               */
 
 /* Set right before a wave plays: the ancestor scale the wave offsets must be
  * divided by so the motion keeps its on-screen size.  Read by WaveEngine.m. */
@@ -147,6 +148,8 @@ static double w26_effectiveScale(UIView *view);
 static BOOL   w26_homeSettled(void);
 static void   w26_stripForeign(UIView *view);
 static void   w26_guardTick(NSArray *icons, int ticksLeft);
+static void   w26_requestFire(double velocity, const char *source);
+static void   w26_panSchedule(double velocity, int attempt);
 
 /* original implementations */
 static IMP w26_orig_setState;
@@ -431,6 +434,7 @@ static double w26_effectiveScale(UIView *view) {
 }
 
 static BOOL w26_homeSettled(void) {
+    if (g_haveCoverClass && g_onLockScreen) return NO;
     NSArray *icons = w26_collectIconViews();
     UIView *first = icons.firstObject;
     if (!first) return NO;
@@ -478,6 +482,7 @@ static void w26_fireDeferred(double velocity) {
             delay, (int)g_unlockFlow, (int)g_panFired);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        g_fireRequested = NO;
         w26_fire(velocity, 0);
     });
 }
@@ -505,10 +510,38 @@ static void w26_waitSettleThenFire(double velocity, int attempt, const char *sou
     });
 }
 
-static void w26_scheduleUnlock(double velocity, const char *source) {
-    if (g_fireDone) return;
+/* Single entry point for every trigger, so all of them honour the settings
+ * and none of them can queue a second wave. */
+static void w26_requestFire(double velocity, const char *source) {
+    if (g_fireDone || g_fireRequested) return;
+    g_fireRequested = YES;
     w26_loadSettings();
     w26_waitSettleThenFire(velocity, 0, source);
+}
+
+/* A swipe up on the lock screen means one of two very different things:
+ *   a) swipe to unlock (no passcode) - the cover sheet disappears within a
+ *      few hundred milliseconds, so play the wave as the home screen appears;
+ *   b) swipe up to reveal the passcode pad - the cover sheet STAYS on screen,
+ *      so the wave must NOT be spent here or the real unlock shows the stock
+ *      animation instead of ours.
+ */
+static void w26_panSchedule(double velocity, int attempt) {
+    if (!g_haveCoverClass || !g_onLockScreen) {
+        w26_requestFire(velocity, "pan");
+        return;
+    }
+    if (attempt >= 12) {                        /* 12 * 0.05 s = 0.6 s */
+        w26_log(@"[pan] cover sheet still visible after %.2f s - cancelling "
+                @"(passcode flow); the unlock path fires later",
+                attempt * 0.05);
+        g_panFired = NO;
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        w26_panSchedule(velocity, attempt + 1);
+    });
 }
 
 static BOOL w26_isUnlockPan(UIGestureRecognizer *gesture) {
@@ -563,9 +596,10 @@ static void w26_setState(UIGestureRecognizer *self, SEL _cmd, UIGestureRecognize
     g_haveVel = YES;
     g_lockScreenDismissed = CFAbsoluteTimeGetCurrent();
     g_panFired = YES;
+    g_unlockFlow = YES;
 
-    w26_log(@"unlock pan ended (vel.y=%.1f) - firing now", velocity.y);
-    w26_fire(velocity.y, 0);
+    w26_log(@"unlock pan ended (vel.y=%.1f)", velocity.y);
+    w26_panSchedule(velocity.y, 0);
 }
 
 static BOOL w26_hasAnimatedIconLayoutBefore(id self, SEL _cmd) {
@@ -589,7 +623,7 @@ static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL an
     if (CFAbsoluteTimeGetCurrent() - g_unlockedAt > 2.5) return;
 
     w26_log(@"home screen fully presented after unlock");
-    w26_scheduleUnlock(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "progress");
+    w26_requestFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "progress");
 }
 
 static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
@@ -601,6 +635,7 @@ static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     g_panFired = NO;
     g_fireDone = NO;
     g_unlockFlow = NO;
+    g_fireRequested = NO;
 }
 
 static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
@@ -626,7 +661,7 @@ static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
 
     w26_log(@"cover sheet disappeared (panFired=%d, lastFire=%.2fs ago)",
             (int)g_panFired, CFAbsoluteTimeGetCurrent() - g_lastFireTime);
-    w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
+    w26_requestFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "cover");
 }
 
 /* ------------------------------------------------------------------ */
@@ -703,18 +738,20 @@ static void w26_registerLockStateNotifications(void) {
             g_panFired = NO;
             g_fireDone = NO;
             g_unlockFlow = NO;
+            g_fireRequested = NO;
             return;
         }
 
         if (state != 0) return;     /* 0 == unlocked */
 
         g_unlockedAt = CFAbsoluteTimeGetCurrent();
+        g_unlockFlow = YES;
 
         if (g_panFired) return;
 
         w26_log(@"unlocked without a pan");
         g_unlockFlow = YES;
-        w26_scheduleUnlock(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "notify");
+        w26_requestFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "notify");
     });
 }
 
