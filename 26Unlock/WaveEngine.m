@@ -312,6 +312,13 @@ static const CGFloat kSpringMass = 1.5;
     }
 
     CGPoint original = layer.position;
+
+    /* The dock starts 380 pt BELOW its home position and springs up into
+     * place.  Recovered from the original binary:
+     *   0x9f08  d0/d1 <- (x, y + 380)  -> valueWithCGPoint: -> setFromValue:
+     *   0x9f44  d0/d1 <- original      -> valueWithCGPoint: -> setToValue:
+     * The previous reconstruction had these two swapped, which made the dock
+     * slide DOWN and snap back - the "dock appears abruptly / jerks" bug. */
     CGPoint target =
         CGPointMake(original.x, original.y + 380.0);
 
@@ -321,8 +328,8 @@ static const CGFloat kSpringMass = 1.5;
     CASpringAnimation *animation =
         [CASpringAnimation animationWithKeyPath:@"position"];
 
-    animation.fromValue = [NSValue valueWithCGPoint:original];
-    animation.toValue = [NSValue valueWithCGPoint:target];
+    animation.fromValue = [NSValue valueWithCGPoint:target];
+    animation.toValue = [NSValue valueWithCGPoint:original];
     animation.damping = 22.0;
     animation.stiffness = 115.0;
     animation.mass = 1.5;

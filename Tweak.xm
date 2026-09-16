@@ -1,44 +1,41 @@
 /*
- * 26Unlock - iOS 26 style center-out unlock wave, rebuilt for arm64e.
+ * 26Unlock - iOS 26 style center-out unlock wave, rebuilt for arm64/arm64e.
  *
- * The animation maths (WaveEngine / WaveTable) is the reverse engineered
- * original and is left untouched.  This file is the plumbing: notice that
- * the device is being unlocked and hand the icon grid to the engine.
+ * IMPORTANT: this tweak deliberately does NOT link CydiaSubstrate / libsubstrate.
+ * Modern rootless jailbreaks (Dopamine 2 + ElleKit on iOS 16) do not ship
+ * /var/jb/Library/Frameworks/CydiaSubstrate.framework, so any dylib whose
+ * load command references it fails dlopen() before its constructor ever runs -
+ * the tweak then looks "installed but dead" and writes nothing at all.  Hooking
+ * is done with the Objective-C runtime (class_addMethod / class_replaceMethod),
+ * which needs nothing but libobjc, so the dylib always loads.
  *
- * Firing logic, recovered instruction by instruction from the original
- * arm64 binary (26Unlock.dylib in original.deb):
+ * Firing logic is recovered instruction by instruction from the original
+ * arm64 binary (26Unlock.dylib inside original.deb):
  *
  *   -[SBCoverSheetViewController viewWillAppear:]
  *        g_onLockScreen = YES;  g_panFired = NO;
  *
- *   -[UIGestureRecognizer setState:]          (SBCoverSheetScreenEdgePanGestureRecognizer)
+ *   -[UIGestureRecognizer setState:]   (SBCoverSheetScreenEdgePanGestureRecognizer)
  *        Ended / Cancelled -> remember velocity, g_panFired = YES,
- *                             wave26_fire()  IMMEDIATELY          (0x60bc)
- *        Possible         -> stamp the dismissal time              (0x60dc)
+ *                             fire IMMEDIATELY                       (0x60bc)
+ *        Possible         -> stamp the dismissal time                (0x60dc)
  *
  *   -[SBCoverSheetViewController viewDidDisappear:]
  *        if (!g_onLockScreen) return;
  *        g_onLockScreen = NO;
- *        if (g_panFired) return;              <-- NOTE: inverted!
- *        dispatch_after(0.35 s, wave26_fire)  <-- unlock without a swipe
- *                                                 (Face ID / passcode), or
- *                                                 when the pan class is missing
+ *        if (g_panFired) return;            <-- pan already played the wave
+ *        dispatch_after(0.35 s) -> fire     <-- unlock without a swipe
  *
- * The previous reconstruction had that last gate backwards
- * ("if (!g_haveLastVel) return;"), which made the tweak 100 % dependent on
- * SBCoverSheetScreenEdgePanGestureRecognizer existing.  On any iOS where
- * that class is missing the tweak stayed completely silent.  This version
- * reproduces the original behaviour and adds a Darwin-notification
- * backstop on top, so the wave plays even when every SpringBoard class
- * lookup fails.
+ * The animation maths (WaveEngine / WaveTable) is the reverse engineered
+ * original and is not touched here.
  *
- * Diagnostics are appended to /var/mobile/26Unlock.log
+ * Diagnostics: /var/mobile/26Unlock.log
  */
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <substrate.h>
+#import <objc/message.h>
 #import <notify.h>
 #import <math.h>
 #import <stdio.h>
@@ -89,18 +86,27 @@ static Class g_edgeClass;       /* SBScreenEdgePanGestureRecognizer (fallback) *
 static Class g_iconClass;       /* SBIconView                                  */
 static Class g_dockClass;       /* SBDockView                                  */
 
-static BOOL  g_haveCoverClass;  /* SBCoverSheetViewController exists?          */
+static BOOL  g_haveCoverClass;
 static BOOL  g_onLockScreen;    /* binary: g_onLockScreen                      */
 static BOOL  g_panFired;        /* binary: g_panFired                          */
 static BOOL  g_haveVel;         /* binary: g_haveVel                           */
 static CGPoint g_lastVel;       /* binary: g_lastVel                           */
 
-static CFTimeInterval g_lastFireTime;      /* binary: g_lastFireTime           */
+static CFTimeInterval g_lastFireTime;
 static CFTimeInterval g_lockScreenDismissed;
+static CFTimeInterval g_unlockedAt;
 
-static const CFTimeInterval kW26Debounce = 0.5;   /* fcmp 0.5 in wave26_fire   */
+static const CFTimeInterval kW26Debounce = 0.5;
 static const double kW26DefaultVelocity  = -1250.0;
-static const double kW26DeferredDelay    = 0.35;  /* 350000000 ns in the binary */
+static const double kW26DeferredDelay    = 0.35;
+
+/* original implementations */
+static IMP w26_orig_setState;
+static IMP w26_orig_hasAnimatedIconLayoutBefore;
+static IMP w26_orig_shouldAnimateIconLaunch;
+static IMP w26_orig_presentationProgress;
+static IMP w26_orig_viewWillAppear;
+static IMP w26_orig_viewDidDisappear;
 
 /* ------------------------------------------------------------------ */
 #pragma mark - view helpers
@@ -111,9 +117,6 @@ static NSArray *w26_allWindows(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return windows;
 
-    /* iOS 13+: the home screen lives in its own UIWindowScene and
-     * -[UIApplication windows] is deprecated, so walk every connected
-     * scene first and only then fall back to the legacy property. */
     if ([app respondsToSelector:@selector(connectedScenes)]) {
         for (UIScene *scene in [app connectedScenes]) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -147,7 +150,6 @@ static void w26_collectViewsOfClass(Class cls, UIView *view, NSMutableArray *out
     }
 }
 
-/* Last-resort root view when no window exposes the icon hierarchy. */
 static UIView *w26_iconControllerRootView(void) {
     Class cls = NSClassFromString(@"SBIconController");
     if (!cls) return nil;
@@ -191,7 +193,6 @@ static UIView *w26_findDockView(void) {
         if (out.firstObject) return out.firstObject;
     }
 
-    /* Fallback: -[SBIconController dockView] */
     Class cls = NSClassFromString(@"SBIconController");
     if ([cls respondsToSelector:@selector(sharedInstance)]) {
         id controller = [cls sharedInstance];
@@ -323,7 +324,6 @@ static void w26_fire(double velocity, int attempt) {
             (unsigned long)icons.count, dock ? @"yes" : @"no", velocity);
 }
 
-/* The 0.35 s path used when the unlock happened without a swipe. */
 static void w26_fireDeferred(double velocity) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kW26DeferredDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -336,8 +336,6 @@ static BOOL w26_isUnlockPan(UIGestureRecognizer *gesture) {
 
     if (g_panClass && [gesture isKindOfClass:g_panClass]) return YES;
 
-    /* Fallback when SBCoverSheetScreenEdgePanGestureRecognizer is gone:
-     * any system edge pan from the BOTTOM edge while the lock screen is up. */
     if (!g_panClass && g_edgeClass && g_onLockScreen &&
         [gesture isKindOfClass:g_edgeClass]) {
         if ([gesture respondsToSelector:@selector(edges)]) {
@@ -349,12 +347,15 @@ static BOOL w26_isUnlockPan(UIGestureRecognizer *gesture) {
 }
 
 /* ------------------------------------------------------------------ */
-#pragma mark - hooks
+#pragma mark - hooked implementations
 /* ------------------------------------------------------------------ */
 
-%hook UIGestureRecognizer
-- (void)setState:(UIGestureRecognizerState)state {
-    %orig;
+static void w26_setState(UIGestureRecognizer *self, SEL _cmd, UIGestureRecognizerState state) {
+    if (w26_orig_setState) {
+        void (*orig)(UIGestureRecognizer *, SEL, UIGestureRecognizerState) =
+            (void (*)(UIGestureRecognizer *, SEL, UIGestureRecognizerState))w26_orig_setState;
+        orig(self, _cmd, state);
+    }
 
     if (!g_engine) return;
     if (!w26_isUnlockPan(self)) return;
@@ -386,42 +387,113 @@ static BOOL w26_isUnlockPan(UIGestureRecognizer *gesture) {
     w26_log(@"unlock pan ended (vel.y=%.1f) - firing now", velocity.y);
     w26_fire(velocity.y, 0);
 }
-%end
 
-%hook SBIconController
-- (BOOL)hasAnimatedIconLayoutBefore {
+static BOOL w26_hasAnimatedIconLayoutBefore(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
     return YES;
 }
 
-- (BOOL)_shouldAnimateIconLaunch {
+static BOOL w26_shouldAnimateIconLaunch(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
     return NO;
 }
 
-- (void)setRootFolderViewControllerPresentationProgress:(double)progress animated:(BOOL)animated completion:(id)completion {
-    %orig(progress, NO, completion);
-}
-%end
+static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL animated, id completion) {
+    if (w26_orig_presentationProgress) {
+        void (*orig)(id, SEL, double, BOOL, id) =
+            (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
+        orig(self, _cmd, progress, NO, completion);
+    }
 
-%hook SBCoverSheetViewController
-- (void)viewWillAppear:(BOOL)animated {
-    %orig(animated);
+    if (progress < 1.0 || g_panFired) return;
+    if (CFAbsoluteTimeGetCurrent() - g_unlockedAt > 2.5) return;
+
+    w26_log(@"home screen fully presented after unlock - deferred fire in 0.35 s");
+    w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
+}
+
+static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (w26_orig_viewWillAppear) {
+        void (*orig)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))w26_orig_viewWillAppear;
+        orig(self, _cmd, animated);
+    }
     g_onLockScreen = YES;
     g_panFired = NO;
 }
 
-- (void)viewDidDisappear:(BOOL)animated {
-    %orig(animated);
+static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
+    if (w26_orig_viewDidDisappear) {
+        void (*orig)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))w26_orig_viewDidDisappear;
+        orig(self, _cmd, animated);
+    }
 
     if (!g_onLockScreen) return;
     g_onLockScreen = NO;
     g_lockScreenDismissed = CFAbsoluteTimeGetCurrent();
+    g_unlockedAt = g_lockScreenDismissed;
 
-    if (g_panFired) return;   /* the pan already played the wave */
+    if (g_panFired) return;
 
     w26_log(@"cover sheet disappeared without a pan - deferred fire in 0.35 s");
     w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
 }
-%end
+
+/* ------------------------------------------------------------------ */
+#pragma mark - hooking (pure Objective-C runtime)
+/* ------------------------------------------------------------------ */
+
+static BOOL w26_swizzle(Class cls, SEL sel, IMP replacement, IMP *original) {
+    if (!cls || !sel || !replacement) return NO;
+
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return NO;
+
+    const char *types = method_getTypeEncoding(method) ?: "v@:";
+    IMP previous = method_getImplementation(method);
+
+    if (class_addMethod(cls, sel, replacement, types)) {
+        /* the class inherited the method - keep the inherited IMP as "original" */
+        if (original) *original = previous;
+        return YES;
+    }
+
+    IMP replaced = class_replaceMethod(cls, sel, replacement, types);
+    if (replaced) {
+        if (original) *original = replaced;
+        return YES;
+    }
+
+    return NO;
+}
+
+static void w26_installHooks(void) {
+    w26_log(@"hook UIGestureRecognizer setState: = %d",
+            w26_swizzle([UIGestureRecognizer class], @selector(setState:),
+                        (IMP)w26_setState, &w26_orig_setState));
+
+    Class iconController = NSClassFromString(@"SBIconController");
+    w26_log(@"hook SBIconController hasAnimatedIconLayoutBefore = %d",
+            w26_swizzle(iconController, @selector(hasAnimatedIconLayoutBefore),
+                        (IMP)w26_hasAnimatedIconLayoutBefore,
+                        &w26_orig_hasAnimatedIconLayoutBefore));
+    w26_log(@"hook SBIconController _shouldAnimateIconLaunch = %d",
+            w26_swizzle(iconController, NSSelectorFromString(@"_shouldAnimateIconLaunch"),
+                        (IMP)w26_shouldAnimateIconLaunch,
+                        &w26_orig_shouldAnimateIconLaunch));
+    w26_log(@"hook SBIconController presentationProgress = %d",
+            w26_swizzle(iconController,
+                        NSSelectorFromString(@"setRootFolderViewControllerPresentationProgress:animated:completion:"),
+                        (IMP)w26_presentationProgress,
+                        &w26_orig_presentationProgress));
+
+    Class coverSheet = NSClassFromString(@"SBCoverSheetViewController");
+    w26_log(@"hook SBCoverSheetViewController viewWillAppear: = %d",
+            w26_swizzle(coverSheet, @selector(viewWillAppear:),
+                        (IMP)w26_viewWillAppear, &w26_orig_viewWillAppear));
+    w26_log(@"hook SBCoverSheetViewController viewDidDisappear: = %d",
+            w26_swizzle(coverSheet, @selector(viewDidDisappear:),
+                        (IMP)w26_viewDidDisappear, &w26_orig_viewDidDisappear));
+}
 
 /* ------------------------------------------------------------------ */
 #pragma mark - init
@@ -443,7 +515,9 @@ static void w26_registerLockStateNotifications(void) {
 
         if (state != 0) return;     /* 0 == unlocked */
 
-        if (g_panFired) return;     /* already played by the pan */
+        g_unlockedAt = CFAbsoluteTimeGetCurrent();
+
+        if (g_panFired) return;
 
         w26_log(@"unlocked without a pan - deferred fire in 0.35 s");
         w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
@@ -460,7 +534,7 @@ static void w26_init(void) {
 
     g_engine = [WaveEngine new];
 
-    w26_log(@"==== 26Unlock loaded ====");
+    w26_log(@"==== 26Unlock loaded (no substrate) ====");
     w26_log(@"iOS %@ | pan=%@ | edge=%@ | icon=%@ | dock=%@ | coverSheetClass=%@",
             [[UIDevice currentDevice] systemVersion],
             g_panClass  ? NSStringFromClass(g_panClass)  : @"MISSING",
@@ -471,10 +545,11 @@ static void w26_init(void) {
     w26_log(@"log file: " W26_LOGFILE);
 }
 
-%ctor {
+__attribute__((constructor))
+static void w26_constructor(void) {
     @autoreleasepool {
         w26_init();
-        %init;
+        w26_installHooks();
         w26_registerLockStateNotifications();
     }
 }

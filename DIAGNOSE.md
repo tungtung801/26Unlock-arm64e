@@ -110,3 +110,84 @@ nội dung. Log sẽ cho biết ngay:
 * Có `MISSING` ở các class → iOS đó đổi tên class.
 * Có `unlock pan ended` / `lockstate = 0` nhưng không có `wave played`, hoặc có dòng
   `no icon views yet` → vấn đề ở khâu tìm icon.
+
+---
+
+## Cập nhật 0.0.3 (2026-09-16)
+
+### ✅ Đã chạy trên roothide A9 / iOS 15
+Bản 0.0.2 đã có hiệu ứng trên máy A9 (roothide, iOS 15) → phần sửa logic kích hoạt
+**đã đúng**. Vậy vấn đề còn lại trên A12 (iOS 16.5.1) là **khác biệt phiên bản iOS**,
+không còn là chuyện arm64/arm64e nữa (cùng 1 deb, 2 slice, chạy được trên A9).
+
+### 🐛 Bug thanh dock giật — đã fix
+Triệu chứng: dock "hiện lên luôn" thay vì trượt mượt từ dưới lên.
+
+Binary gốc, `-[WaveEngine animateDock:]`:
+
+```
+0x9e90  ldr d2, [0xb5e0]        ; 380.0
+0x9e98  fadd d1, d1, d2         ; y + 380
+0x9f08  ldr d0/d1 <- (x, y+380) -> valueWithCGPoint: -> setFromValue:   ← BẮT ĐẦU ở dưới
+0x9f44  ldr d0/d1 <- vị trí gốc -> valueWithCGPoint: -> setToValue:     ← KẾT THÚC tại chỗ cũ
+```
+
+Repo đang để ngược (`from = gốc, to = +380`) → dock trượt **xuống** rồi giật ngược lại.
+Đã đổi lại `fromValue = (x, y+380)`, `toValue = original` trong `26Unlock/WaveEngine.m`.
+
+### ➕ Thêm đường kích hoạt thứ 4 (dự phòng cho iOS 16)
+`setRootFolderViewControllerPresentationProgress:animated:completion:` khi
+`progress >= 1.0` và vừa rời màn hình khóa trong vòng 2.5 s → fire sau 0.35 s.
+(Có cửa sổ thời gian nên đóng app về home screen sẽ không bị chạy nhầm.)
+
+### ❓ A12 / iOS 16.5.1 vẫn im lặng — cần log
+Có 4 đường kích hoạt rồi nên nếu vẫn không có gì, khả năng cao **dylib không được
+inject**. Cách biết ngay: sau khi cài + respring, mở **Filza → `/var/mobile/26Unlock.log`**.
+
+* **Không có file** → dylib chưa bao giờ chạy → lỗi injection (Dopamine/ElleKit),
+  không phải lỗi code.
+* **Có file** → gửi nội dung, log chỉ rõ thiếu class nào / có thấy icon không.
+
+---
+
+## 🎯 Nguyên nhân cuối cùng trên A12 / iOS 16.5.1 (bản 0.0.4)
+
+Kiểm tra trên máy: dylib + plist nằm đúng chỗ, Tweak Injection bật, tweak
+SpringBoard khác chạy bình thường — **nhưng `/var/jb/Library/Frameworks/CydiaSubstrate.framework` không tồn tại**.
+
+Mà dylib của chúng ta có:
+
+```
+LC_LOAD_DYLIB   @rpath/CydiaSubstrate.framework/CydiaSubstrate
+LC_RPATH        /var/jb/Library/Frameworks
+LC_RPATH        /var/jb/usr/lib
+LC_RPATH        @loader_path/.jbroot/Library/Frameworks
+LC_RPATH        @loader_path/.jbroot/usr/lib
+```
+
+→ `dlopen()` thất bại **trước khi constructor chạy** ⇒ không log, không hiệu ứng,
+trông như "cài rồi mà chết". Đây là lý do bản 0.0.1/0.0.2 im lặng trên A12 dù
+build arm64e hoàn toàn đúng.
+
+**ElleKit trên Dopamine 2 (iOS 16) không cài `CydiaSubstrate.framework`**, chỉ có
+`/var/jb/usr/lib/libsubstrate.dylib`. Các tweak khác chạy được vì chúng không
+phụ thuộc framework đó.
+
+### Cách sửa: không dùng Substrate nữa
+
+* `Makefile`: bỏ `26Unlock_LIBRARIES = substrate`.
+* `Tweak.xm`: bỏ toàn bộ Logos `%hook/%ctor/%orig` (`MSHookMessageEx`), thay bằng
+  swizzle thuần Objective-C runtime: `class_getInstanceMethod` →
+  `class_addMethod` (nếu kế thừa) / `class_replaceMethod`, lưu IMP gốc để gọi lại.
+
+Dylib bây giờ chỉ phụ thuộc UIKit / QuartzCore / CoreGraphics / Foundation →
+**load được trên mọi loại jailbreak** (Dopamine rootless, roothide, palera1n),
+không cần bất kỳ thư viện hook nào.
+
+Log sẽ ghi rõ từng hook có gắn được không, ví dụ:
+
+```
+hook UIGestureRecognizer setState: = 1
+hook SBIconController hasAnimatedIconLayoutBefore = 1
+hook SBIconController presentationProgress = 0     ← 0 = iOS này không có method
+```

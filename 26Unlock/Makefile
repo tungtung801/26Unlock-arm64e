@@ -14,7 +14,10 @@ TWEAK_NAME = 26Unlock
 26Unlock_FILES = Tweak.xm WaveEngine.m WaveTable.m WaveIcon.m
 26Unlock_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 26Unlock_FRAMEWORKS = UIKit QuartzCore CoreGraphics
-26Unlock_LIBRARIES = substrate
+# NOTE: intentionally NOT linking substrate.  ElleKit (Dopamine 2, iOS 16) does
+# not ship /var/jb/Library/Frameworks/CydiaSubstrate.framework, so a dylib that
+# references it fails dlopen() before its constructor runs - the tweak looks
+# installed but does nothing.  Hooking is done with the ObjC runtime instead.
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
