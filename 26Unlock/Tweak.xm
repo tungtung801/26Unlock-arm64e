@@ -99,6 +99,10 @@ static CFTimeInterval g_unlockedAt;
 static const CFTimeInterval kW26Debounce = 0.5;
 static const double kW26DefaultVelocity  = -1250.0;
 static const double kW26DeferredDelay    = 0.35;
+/* If the pan already played a wave but the unlock only finished much later
+ * (passcode typing takes seconds), play a fresh one at the cover-sheet
+ * moment so both cases look identical. */
+static const CFTimeInterval kW26PanReFireWindow = 1.5;
 
 /* original implementations */
 static IMP w26_orig_setState;
@@ -309,6 +313,31 @@ static void w26_fire(double velocity, int attempt) {
 
     g_lastFireTime = now;
 
+    /* ---- grid diagnostics (so a "clumped" wave can be diagnosed) ---- */
+    {
+        double minX = INFINITY, maxX = -INFINITY, minY = INFINITY, maxY = -INFINITY;
+        for (UIView *v in icons) {
+            CGRect f = [v convertRect:v.bounds toView:nil];
+            double mx = CGRectGetMidX(f), my = CGRectGetMidY(f);
+            if (mx < minX) minX = mx; if (mx > maxX) maxX = mx;
+            if (my < minY) minY = my; if (my > maxY) maxY = my;
+        }
+        double cw = MAX(1.0, maxX - minX) / 4.0, ch = MAX(1.0, maxY - minY) / 6.0;
+        NSMutableSet *cells = [NSMutableSet set];
+        for (UIView *v in icons) {
+            CGRect f = [v convertRect:v.bounds toView:nil];
+            int c = (int)((CGRectGetMidX(f) - minX) / cw); if (c < 0) c = 0; if (c > 3) c = 3;
+            int r = (int)((CGRectGetMidY(f) - minY) / ch); if (r < 0) r = 0; if (r > 5) r = 5;
+            [cells addObject:[NSString stringWithFormat:@"%d,%d", c, r]];
+        }
+        CGAffineTransform t = CGAffineTransformIdentity;
+        UIView *first = icons.firstObject;
+        if (first && first.superview) t = first.superview.transform;
+        w26_log(@"grid: bbox=(%.0f,%.0f)-(%.0f,%.0f) cell=%.1fx%.1f cells=%lu/%lu ancestorScale=(%.3f,%.3f)",
+                minX, minY, maxX, maxY, cw, ch,
+                (unsigned long)cells.count, (unsigned long)icons.count, t.a, t.d);
+    }
+
     UIView *dock = w26_findDockView();
     w26_registerHome(icons, dock);
 
@@ -322,6 +351,32 @@ static void w26_fire(double velocity, int attempt) {
 
     w26_log(@"fire: wave played - %lu icons, dock=%@, velocity=%.1f",
             (unsigned long)icons.count, dock ? @"yes" : @"no", velocity);
+}
+
+/* Fallback triggers (Darwin notification, presentation progress) must NOT fire
+ * while the lock screen is still on screen: the home screen has not settled yet
+ * and the wave collapses into a clump.  Wait for the cover sheet to disappear
+ * first - exactly what the (perfect looking) cover-sheet path does - and only
+ * then apply the same 0.35 s delay. */
+static void w26_waitCoverSheetThenFire(double velocity, int attempt, const char *source) {
+    if (g_fireScheduled) return;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - g_lastFireTime < kW26Debounce) return;
+    if (!g_haveCoverClass || !g_onLockScreen) {
+        w26_log(@"[%s] cover sheet already gone - firing in 0.35 s", source);
+        w26_fireDeferred(velocity);
+        return;
+    }
+    if (attempt >= 25) {
+        w26_log(@"[%s] give up: lock screen never disappeared", source);
+        return;
+    }
+    g_fireScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        g_fireScheduled = NO;
+        w26_waitCoverSheetThenFire(velocity, attempt + 1, source);
+    });
 }
 
 static void w26_fireDeferred(double velocity) {
@@ -408,8 +463,8 @@ static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL an
     if (progress < 1.0 || g_panFired) return;
     if (CFAbsoluteTimeGetCurrent() - g_unlockedAt > 2.5) return;
 
-    w26_log(@"home screen fully presented after unlock - deferred fire in 0.35 s");
-    w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
+    w26_log(@"home screen fully presented after unlock");
+    w26_waitCoverSheetThenFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, 0, "progress");
 }
 
 static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
@@ -432,9 +487,14 @@ static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
     g_lockScreenDismissed = CFAbsoluteTimeGetCurrent();
     g_unlockedAt = g_lockScreenDismissed;
 
-    if (g_panFired) return;
+    if (g_panFired &&
+        (CFAbsoluteTimeGetCurrent() - g_lastFireTime) < kW26PanReFireWindow) {
+        /* the pan wave is still fresh - do not play twice */
+        return;
+    }
 
-    w26_log(@"cover sheet disappeared without a pan - deferred fire in 0.35 s");
+    w26_log(@"cover sheet disappeared (panFired=%d, lastFire=%.2fs ago) - firing in 0.35 s",
+            (int)g_panFired, CFAbsoluteTimeGetCurrent() - g_lastFireTime);
     w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
 }
 
@@ -519,8 +579,8 @@ static void w26_registerLockStateNotifications(void) {
 
         if (g_panFired) return;
 
-        w26_log(@"unlocked without a pan - deferred fire in 0.35 s");
-        w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
+        w26_log(@"unlocked without a pan");
+        w26_waitCoverSheetThenFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, 0, "notify");
     });
 }
 
