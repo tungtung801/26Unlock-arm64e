@@ -1,5 +1,8 @@
-export TARGET = iphone:clang:latest:16.0
-export ARCHS = arm64e
+export TARGET = iphone:clang:latest:15.0
+# arm64e  -> A12+ (PAC), the slice SpringBoard uses on the target device
+# arm64   -> A11 and below, so the same .deb still works on the older phone
+#            (dyld picks the matching slice automatically)
+export ARCHS = arm64 arm64e
 export THEOS_PACKAGE_SCHEME = rootless
 
 INSTALL_TARGET_PROCESSES = SpringBoard

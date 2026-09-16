@@ -1,0 +1,112 @@
+# Vì sao bản arm64e không chạy và đã sửa gì
+
+## 1. Build không phải là lỗi
+
+Mổ `packages/com.blu-tek.26wave_0.0.1-174+debug_iphoneos-arm64.deb` (bản build cũ) ra kiểm tra:
+
+| Kiểm tra | Kết quả |
+|---|---|
+| `26Unlock.dylib` | Mach-O **arm64e**, cpusubtype `0x80000002` (**PAC00**) ✅ |
+| Chữ ký | `LC_CODE_SIGNATURE`, CodeDirectory v0x20400, ad-hoc ✅ |
+| Đường dẫn | `var/jb/Library/MobileSubstrate/DynamicLibraries/` (rootless) ✅ |
+| Filter plist | `Filter → Bundles → com.apple.springboard` ✅ |
+| Hook có trong binary | `setState:`, `viewWillAppear:`, `viewDidDisappear:`, `hasAnimatedIconLayoutBefore`, `_shouldAnimateIconLaunch`, `setRootFolderViewControllerPresentationProgress:animated:completion:` ✅ |
+
+→ Chuyển arm64e **đã xong**. Lỗi nằm ở logic chạy (runtime).
+
+## 2. Lỗi thật sự: đảo ngược điều kiện kích hoạt
+
+Bản `Tweak.xm` trong repo được dịch ngược lại từ binary gốc. Khi đối chiếu từng lệnh
+(capstone, `26Unlock.dylib` trong `original.deb`), hai chỗ **trái ngược hoàn toàn**:
+
+### Binary gốc (`original.deb`)
+
+```
+-[SBCoverSheetViewController viewWillAppear:]
+    g_onLockScreen = 1;  g_panFired = 0;                    @0x61ec
+
+-[UIGestureRecognizer setState:]   (chỉ nhận SBCoverSheetScreenEdgePanGestureRecognizer)
+    Ended/Cancelled → g_lastVel = …, g_haveVel = 1,
+                      g_panFired = 1, wave26_fire() NGAY   @0x60bc
+    Possible        → chỉ đóng dấu thời gian                @0x60dc
+
+-[SBCoverSheetViewController viewDidDisappear:]
+    if (!g_onLockScreen) return;
+    g_onLockScreen = 0;
+    if (g_panFired) return;          ← pan đã chạy rồi thì thôi
+    dispatch_after(0.35 s) → wave26_fire()   ← mở khóa KHÔNG quẹt
+```
+
+### Bản trong repo (sai)
+
+```objc
+if (!g_haveLastVel) return;          ← ngược lại: không có velocity thì BỎ CUỘC
+dispatch_after(0.14 s)               ← 0.35 s trong binary (0x14DC9380 ns)
+```
+
+**Hậu quả:** `g_haveLastVel` chỉ thành `YES` khi hook `-setState:` gặp đúng class
+`SBCoverSheetScreenEdgePanGestureRecognizer`. Nếu class này không tồn tại trên iOS của máy
+(đổi tên/khác phiên bản) thì:
+
+* hook gesture không bao giờ nhận diện được → `g_haveLastVel` mãi mãi `NO`;
+* `viewDidDisappear:` cũng bỏ cuộc vì chính cái gate đó;
+
+→ **tweak câm hoàn toàn, không bao giờ có hoạt ảnh**. Bản gốc thì khác: đường
+0.35 s của nó tồn tại *chính để* lo trường hợp này (mở khóa bằng Face ID/mật mã,
+hoặc không tìm thấy class pan), nên vẫn chạy.
+
+Và đúng: `original.deb` (arm64) không chạy trên A12 là **chuyện bình thường** —
+không inject được dylib arm64 vào SpringBoard arm64e. Không suy ra được gì từ việc đó.
+
+## 3. Những gì đã sửa trong `26Unlock/Tweak.xm`
+
+1. **Trả lại đúng logic gốc**: pan kết thúc → `wave26_fire()` ngay lập tức;
+   màn hình khóa biến mất mà chưa có pan → fire sau **0.35 s**.
+2. **Thêm đường dự phòng Darwin notify** `com.apple.springboard.lockstate`
+   (state `0` = đã mở khóa): hoạt ảnh vẫn chạy ngay cả khi mọi lookup class
+   SpringBoard đều trượt.
+3. **Fallback tìm class pan**: `SBCoverSheetPanGestureRecognizer`, rồi
+   `SBScreenEdgePanGestureRecognizer` (chỉ nhận cạnh dưới + đang ở màn hình khóa).
+4. **`allWindows()` an toàn hơn**: duyệt `UIApplication.connectedScenes →
+   UIWindowScene.windows` (iOS 13+) trước, rồi mới tới `UIApplication.windows`
+   (deprecated — có bản iOS trả về rỗng), cộng `keyWindow`.
+   Nếu vẫn không thấy icon → thử đi từ `SBIconController.sharedInstance.view`.
+5. **Dock**: thử `- [SBIconController dockView]` nếu không quét được `SBDockView`.
+6. **Retry**: chưa thấy `SBIconView` thì thử lại 3 lần cách nhau 0.12 s.
+7. **Ghi log** ra `/var/mobile/26Unlock.log` (tự xoay khi > 200 KB) — nếu vẫn lỗi,
+   mở file này bằng Filza gửi cho mình là biết ngay.
+
+Phần toán hoạt ảnh (`WaveEngine.m`, `WaveTable.m`, cách tính cột/hàng, hằng số
+`-1250`, `300`, `(1.5, 2.5)`…) **không đụng vào**.
+
+## 4. Build & cài
+
+```bash
+git add -A && git commit -m "fix: restore original firing logic + arm64/arm64e" && git push
+```
+
+GitHub Actions (tab **Actions → Build 26Unlock → Run workflow**) sẽ build bằng
+Xcode 16.4 + theos, ra artifact `26Unlock-rootless-arm64e`.
+
+Package bây giờ chứa **cả hai slice `arm64` + `arm64e`** (dyld tự chọn), deployment
+target hạ xuống **iOS 15.0**, version `0.0.2`.
+
+Trên máy A12 (Dopamine 2):
+
+1. Mở app **Dopamine → Settings → bật "Tweak Injection"** (và đã cài **ElleKit**).
+2. Cài deb bằng Sileo.
+3. Respring.
+
+## 5. Nếu vẫn không chạy — khoanh vùng trong 2 phút
+
+Việc đầu tiên: **cài thử một tweak bất kỳ từ repo rootless** (vd. một tweak đổi text
+status bar). Nếu tweak đó cũng không chạy → vấn đề nằm ở injection (Dopamine/ElleKit),
+không phải ở 26Unlock.
+
+Nếu tweak khác chạy bình thường, mở **Filza → `/var/mobile/26Unlock.log`** và gửi mình
+nội dung. Log sẽ cho biết ngay:
+
+* Không có dòng `==== 26Unlock loaded ====` → **dylib không được inject** (injection/lỗi load).
+* Có `MISSING` ở các class → iOS đó đổi tên class.
+* Có `unlock pan ended` / `lockstate = 0` nhưng không có `wave played`, hoặc có dòng
+  `no icon views yet` → vấn đề ở khâu tìm icon.
