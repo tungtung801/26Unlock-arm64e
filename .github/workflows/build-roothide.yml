@@ -111,5 +111,7 @@ jobs:
           find . -name '*.dylib' -exec otool -hv {} \; | grep -E "ARM64|cpusubtype"
           echo "=== linked libraries (must NOT list CydiaSubstrate) ==="
           find . -name '*.dylib' -exec otool -L {} \;
+          echo "=== code signature ==="
+          find . -name '*.dylib' -exec sh -c 'echo "--- $1"; otool -l "$1" | grep -A3 LC_CODE_SIGNATURE || echo "NO CODE SIGNATURE"; codesign -dvv "$1" 2>&1 | head -8' _ {} \;
           echo "=== /var/jb strings inside the dylib (must be 0) ==="
           find . -name '*.dylib' -print0 | xargs -0 -I{} sh -c 'printf "%s: " "{}"; strings "{}" | grep -c "/var/jb" || echo 0'
