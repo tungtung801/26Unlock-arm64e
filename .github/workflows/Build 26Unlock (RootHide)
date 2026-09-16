@@ -1,0 +1,72 @@
+name: Build 26Unlock (RootHide)
+
+# For devices running the roothide jailbreak (jbroot is randomised, package
+# architecture is iphoneos-arm64e).  Building this way removes every /var/jb
+# string from the dylib, so roothide no longer creates a
+# "26Unlock.dylib.roothidepatch" symlink and no dynamic patch module is loaded.
+# That dynamic patching is instruction-address based and breaks the arm64e
+# slice of a fat dylib (worked on A9/arm64, silently dead on A12/arm64e).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
+
+      - name: Install dependencies
+        run: |
+          brew install ldid make
+
+      - name: Install RootHide Theos
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+          echo "--- locate theos ---"
+          ls -d "$HOME/theos" || ls -d "$HOME/.theos" || true
+          if [ -d "$HOME/theos" ]; then echo "THEOS=$HOME/theos" >> $GITHUB_ENV; fi
+          if [ -d "$HOME/.theos" ]; then echo "THEOS=$HOME/.theos" >> $GITHUB_ENV; fi
+
+      - name: Remove stale packages
+        working-directory: 26Unlock
+        run: rm -f packages/*.deb
+
+      - name: Build roothide package
+        working-directory: 26Unlock
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS="arm64 arm64e"
+
+      - name: Verify payload
+        working-directory: 26Unlock
+        run: |
+          DEB=$(ls packages/*.deb | head -1)
+          echo "deb: $DEB"
+          echo "=== control fields ==="
+          dpkg-deb -f "$DEB" Package Version Architecture
+          echo "=== payload ==="
+          dpkg-deb -c "$DEB"
+          echo "=== slices ==="
+          find . -name '*.dylib' -exec otool -hv {} \; | grep -E "ARM64|cpusubtype"
+          echo "=== linked libraries (must NOT list CydiaSubstrate) ==="
+          find . -name '*.dylib' -exec otool -L {} \;
+          echo "=== /var/jb strings inside the dylib (must be 0) ==="
+          find . -name '*.dylib' -print0 | xargs -0 -I{} sh -c 'echo -n "{}: "; strings "{}" | grep -c "/var/jb" || echo 0'
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 26Unlock-roothide
+          path: 26Unlock/packages/*.deb
+          if-no-files-found: error
