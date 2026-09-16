@@ -113,7 +113,8 @@ static const CFTimeInterval kW26PanReFireWindow = 1.5;
 /* Every value below can be changed on device without rebuilding: edit
  * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
 static double g_cfgUnlockDelay = 0.00;  /* delay used on the unlock flow      */
-static BOOL   g_cfgWaitSettle  = NO;    /* wait for the home screen to settle */
+static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
+static BOOL   g_cfgWaitCover   = YES;   /* wait until the lock screen is gone */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
@@ -132,6 +133,8 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
     v = [d objectForKey:@"ForcePresentation"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgForcePres   = [v boolValue];
+    v = [d objectForKey:@"WaitForCoverSheet"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitCover   = [v boolValue];
 }
 
 /* ------------------------------------------------------------------ */
@@ -461,16 +464,28 @@ static double w26_effectiveScale(UIView *view) {
     double s = 1.0;
     UIView *a = view.superview;
     for (int i = 0; a && i < 12; i++) {
-        CGAffineTransform t = a.transform;
-        double det = t.a * t.d - t.b * t.c;
-        if (det > 0.0001) s *= sqrt(det);
+        CALayer *l = a.layer;
+        if (l) {
+            /* UIView.transform lives in layer.transform - reading both would
+             * count the same scale twice.  sublayerTransform scales all
+             * descendants, so it has to be included too. */
+            CATransform3D t = l.transform;
+            if (!CATransform3DIsIdentity(t)) {
+                double det = t.m11 * t.m22 - t.m12 * t.m21;
+                if (det > 0.0001) s *= sqrt(det);
+            }
+            CATransform3D st = l.sublayerTransform;
+            if (!CATransform3DIsIdentity(st)) {
+                double det = st.m11 * st.m22 - st.m12 * st.m21;
+                if (det > 0.0001) s *= sqrt(det);
+            }
+        }
         a = a.superview;
     }
     return s;
 }
 
 static BOOL w26_homeSettled(void) {
-    if (g_haveCoverClass && g_onLockScreen) return NO;
     NSArray *icons = w26_collectIconViews();
     UIView *first = icons.firstObject;
     if (!first) return NO;
@@ -530,9 +545,24 @@ static void w26_waitSettleThenFire(double velocity, int attempt, const char *sou
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (now - g_lastFireTime < kW26Debounce) return;
 
-    if (!g_cfgWaitSettle || attempt >= 12 || w26_homeSettled()) {
-        if (g_cfgWaitSettle) {
-            w26_log(@"[%s] home settled after %.2f s", source, attempt * 0.05);
+    /* Two independent, separately tunable waits:
+     *   WaitForCoverSheet - the wave must not start while the lock screen
+     *                       still covers the home screen (it would be over
+     *                       before the home screen becomes visible).
+     *   WaitForSettle     - wait until the icon grid is no longer scaled.
+     * ForcePresentation already snaps the grid to its final layout, so the
+     * second wait is normally unnecessary and defaults to off. */
+    BOOL waiting = NO;
+    if (g_cfgWaitCover && g_haveCoverClass && g_onLockScreen && attempt < 20) {
+        waiting = YES;                              /* 20 * 0.05 s = 1.0 s */
+    }
+    if (g_cfgWaitSettle && attempt < 12 && !w26_homeSettled()) {
+        waiting = YES;                              /* 12 * 0.05 s = 0.6 s */
+    }
+
+    if (!waiting) {
+        if (attempt > 0) {
+            w26_log(@"[%s] waited %.2f s before firing", source, attempt * 0.05);
         }
         w26_fireDeferred(velocity);
         return;
