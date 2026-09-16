@@ -114,7 +114,7 @@ static const CFTimeInterval kW26PanReFireWindow = 1.5;
  * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
 static double g_cfgUnlockDelay = 0.00;  /* delay used on the unlock flow      */
 static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
-static BOOL   g_cfgWaitCover   = YES;   /* wait until the lock screen is gone */
+static BOOL   g_cfgWaitCover   = NO;   /* wait until the lock screen is gone */
 static BOOL   g_cfgWaitGrid    = YES;   /* wait until the icon grid is at home*/
 static double g_cfgGridMin     = 0.50;  /* min bbox width / screen width      */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
@@ -160,6 +160,7 @@ double W26ScaleComp = 1.0;
 
 static void   w26_forceHomePresentation(void);
 static BOOL   w26_gridAtHome(NSArray *icons, double *outSpan);
+static BOOL   w26_swizzle(Class cls, SEL sel, IMP replacement, IMP *original);
 static double w26_effectiveScale(UIView *view);
 static BOOL   w26_homeSettled(void);
 static void   w26_stripForeign(UIView *view);
@@ -172,6 +173,8 @@ static IMP w26_orig_setState;
 static IMP w26_orig_hasAnimatedIconLayoutBefore;
 static IMP w26_orig_shouldAnimateIconLaunch;
 static IMP w26_orig_presentationProgress;
+static SEL w26_presSEL;                 /* which selector actually exists   */
+static int w26_presKind;                /* 0 none / 4 no-completion / 5 full */
 static IMP w26_orig_viewWillAppear;
 static IMP w26_orig_viewDidDisappear;
 
@@ -498,13 +501,18 @@ static void w26_forceHomePresentation(void) {
     id controller = [cls sharedInstance];
     if (!controller) return;
 
-    SEL sel = NSSelectorFromString(
-        @"setRootFolderViewControllerPresentationProgress:animated:completion:");
-    if (![controller respondsToSelector:sel]) return;
-
-    void (*orig)(id, SEL, double, BOOL, id) =
-        (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
-    orig(controller, sel, 1.0, NO, nil);
+    if (w26_presKind == 5) {
+        void (*orig)(id, SEL, double, BOOL, id) =
+            (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
+        orig(controller, w26_presSEL, 1.0, NO, nil);
+    } else if (w26_presKind == 4) {
+        void (*orig)(id, SEL, double, BOOL) =
+            (void (*)(id, SEL, double, BOOL))w26_orig_presentationProgress;
+        orig(controller, w26_presSEL, 1.0, NO);
+    } else {
+        w26_log(@"forcePresentation: no presentation selector - skipped");
+        return;
+    }
     w26_log(@"forced home presentation to 1.0 (animated:NO)");
 }
 
@@ -730,22 +738,68 @@ static BOOL w26_shouldAnimateIconLaunch(id self, SEL _cmd) {
     return NO;
 }
 
-static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL animated, id completion) {
-    if (w26_orig_presentationProgress) {
-        void (*orig)(id, SEL, double, BOOL, id) =
-            (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
-        /* While a wave runs the home screen must stay fully presented,
-         * otherwise SpringBoard's per-frame progress values snap the icons
-         * back towards their condensed (pre-unlock) positions and the wave
-         * collapses into a clump. */
-        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO, completion);
-    }
-
+static void w26_presProgressReached(double progress) {
     if (progress < 1.0 || g_panFired) return;
     if (CFAbsoluteTimeGetCurrent() - g_unlockedAt > 2.5) return;
 
     w26_log(@"home screen fully presented after unlock");
     w26_requestFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "progress");
+}
+
+/* SpringBoard keeps feeding new progress values every frame while it reveals
+ * the home screen.  While a wave runs we pin the value at 1.0 so the icons can
+ * never be pulled back towards their condensed pre-unlock positions - that is
+ * what turned the wave into a "circle blob". */
+static void w26_presWithCompletion(id self, SEL _cmd, double progress, BOOL animated, id completion) {
+    if (w26_orig_presentationProgress) {
+        void (*orig)(id, SEL, double, BOOL, id) =
+            (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
+        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO, completion);
+    }
+    w26_presProgressReached(progress);
+}
+
+static void w26_presNoCompletion(id self, SEL _cmd, double progress, BOOL animated) {
+    if (w26_orig_presentationProgress) {
+        void (*orig)(id, SEL, double, BOOL) =
+            (void (*)(id, SEL, double, BOOL))w26_orig_presentationProgress;
+        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO);
+    }
+    w26_presProgressReached(progress);
+}
+
+/* The selector was renamed more than once across iOS versions, so try every
+ * spelling and hook whichever one this device actually has. */
+static void w26_hookPresentationProgress(Class cls) {
+    static const char *names[] = {
+        "setRootFolderViewControllerPresentationProgress:animated:completion:",
+        "setRootFolderViewControllerPresentationProgress:animated:",
+        "setRootFolderPresentationProgress:animated:completion:",
+        "setRootFolderPresentationProgress:animated:",
+        "setPresentationProgress:animated:completion:",
+        "setPresentationProgress:animated:",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        SEL sel = sel_registerName(names[i]);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) continue;
+
+        unsigned args = method_getNumberOfArguments(m);
+        IMP replacement = NULL;
+        if (args == 5)      replacement = (IMP)w26_presWithCompletion;
+        else if (args == 4) replacement = (IMP)w26_presNoCompletion;
+        else continue;
+
+        if (w26_swizzle(cls, sel, replacement, &w26_orig_presentationProgress)) {
+            w26_presSEL  = sel;
+            w26_presKind = (int)args;
+            w26_log(@"hook presentationProgress = %s (%u args)", names[i], args);
+            return;
+        }
+    }
+
+    w26_log(@"hook presentationProgress = NONE (no known selector on this iOS)");
 }
 
 static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
@@ -828,11 +882,7 @@ static void w26_installHooks(void) {
             w26_swizzle(iconController, NSSelectorFromString(@"_shouldAnimateIconLaunch"),
                         (IMP)w26_shouldAnimateIconLaunch,
                         &w26_orig_shouldAnimateIconLaunch));
-    w26_log(@"hook SBIconController presentationProgress = %d",
-            w26_swizzle(iconController,
-                        NSSelectorFromString(@"setRootFolderViewControllerPresentationProgress:animated:completion:"),
-                        (IMP)w26_presentationProgress,
-                        &w26_orig_presentationProgress));
+    w26_hookPresentationProgress(iconController);
 
     Class coverSheet = NSClassFromString(@"SBCoverSheetViewController");
     w26_log(@"hook SBCoverSheetViewController viewWillAppear: = %d",

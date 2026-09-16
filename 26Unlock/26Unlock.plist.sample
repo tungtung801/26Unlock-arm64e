@@ -5,7 +5,7 @@
 	<key>UnlockDelay</key>
 	<real>0.0</real>
 	<key>WaitForCoverSheet</key>
-	<true/>
+	<false/>
 	<key>WaitForGrid</key>
 	<true/>
 	<key>GridMinWidth</key>
