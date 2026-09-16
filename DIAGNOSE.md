@@ -191,3 +191,57 @@ hook UIGestureRecognizer setState: = 1
 hook SBIconController hasAnimatedIconLayoutBefore = 1
 hook SBIconController presentationProgress = 0     ← 0 = iOS này không có method
 ```
+
+---
+
+## 🧩 Vì sao A12 vẫn chết dù đã bỏ Substrate (bản 0.0.5 / roothide)
+
+Ảnh Filza trên máy A12 cho thấy trong
+`/var/jb/Library/MobileSubstrate/DynamicLibraries/`:
+
+```
+26Unlock.dylib                  203 KB
+26Unlock.plist                  308 byte
+26Unlock.dylib.roothidepatch    100 byte   lrwxr-xr-x   ← SYMLINK
+```
+
+Theo `roothide/DynamicPatches`: roothide tạo **symlink đuôi `.roothidepatch`**
+cho mọi mach-o còn chứa chuỗi `/var/jb`, symlink này trỏ tới **module vá động**
+(PatchLoader nạp module đó *trước* TweakLoader). Module vá hoạt động theo
+**địa chỉ lệnh + thanh ghi**:
+
+> "we can make a patch list of all instruction addresses and registers"
+
+Dylib của ta là **fat (arm64 + arm64e)**:
+
+| Máy | Slice được nạp | Module vá | Kết quả |
+|---|---|---|---|
+| A9 (arm64, iOS 15) | arm64 | vá đúng địa chỉ | chạy ngon ✅ |
+| A12 (arm64e, iOS 16.5.1) | arm64e | **vá sai địa chỉ** | không load ❌ |
+
+Nguyên nhân gốc của chuỗi `/var/jb` nằm ở 2 rpath do theos rootless tự thêm
+(`vendor/mod/rootless/instance/rules.mk`):
+
+```make
+_THEOS_INTERNAL_LDFLAGS += -rpath $(THEOS_PACKAGE_INSTALL_PREFIX)/Library/Frameworks  # /var/jb/...
+_THEOS_INTERNAL_LDFLAGS += -rpath $(THEOS_PACKAGE_INSTALL_PREFIX)/usr/lib             # /var/jb/...
+```
+
+### Cách sửa: build gói roothide bằng roothide/theos
+
+Theo `roothide/Developer`, với tweak không dùng file API để truy cập file
+jailbreak (26Unlock chỉ ghi `/var/mobile/26Unlock.log`, ngoài jbroot) thì chỉ
+cần:
+
+```bash
+# cài roothide/theos (tương thích 100% theos gốc)
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS="arm64 arm64e"
+```
+
+→ kiến trúc gói thành `iphoneos-arm64e`, dylib **không còn chuỗi `/var/jb`** ⇒
+roothide **không tạo `.roothidepatch`** ⇒ không có module vá ⇒ nạp sạch trên cả
+arm64 lẫn arm64e.
+
+Workflow mới: `.github/workflows/build-roothide.yml` (artifact `26Unlock-roothide`),
+có bước kiểm tra `strings ... | grep -c "/var/jb"` phải ra **0**.
