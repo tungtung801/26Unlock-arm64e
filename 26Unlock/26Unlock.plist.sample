@@ -3,12 +3,14 @@
 <plist version="1.0">
 <dict>
 	<key>UnlockDelay</key>
-	<real>0.35</real>
+	<real>0.0</real>
 	<key>WaitForSettle</key>
 	<false/>
 	<key>ScaleComp</key>
 	<true/>
 	<key>GuardDuration</key>
 	<real>0.6</real>
+	<key>ForcePresentation</key>
+	<true/>
 </dict>
 </plist>

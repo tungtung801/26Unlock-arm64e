@@ -112,10 +112,11 @@ static const CFTimeInterval kW26PanReFireWindow = 1.5;
 
 /* Every value below can be changed on device without rebuilding: edit
  * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
-static double g_cfgUnlockDelay = 0.35;  /* delay used on the unlock flow      */
-static BOOL   g_cfgWaitSettle  = YES;   /* wait for the home screen to settle */
+static double g_cfgUnlockDelay = 0.00;  /* delay used on the unlock flow      */
+static BOOL   g_cfgWaitSettle  = NO;    /* wait for the home screen to settle */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
+static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
 
 static void w26_loadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
@@ -129,6 +130,8 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgScaleComp   = [v boolValue];
     v = [d objectForKey:@"GuardDuration"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
+    v = [d objectForKey:@"ForcePresentation"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgForcePres   = [v boolValue];
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,11 +142,13 @@ static BOOL g_fireScheduled;   /* a fire is already pending              */
 static BOOL g_fireDone;        /* a wave already played for this flow    */
 static BOOL g_unlockFlow;      /* cover sheet going away == unlock       */
 static BOOL g_fireRequested;   /* a fire is already queued               */
+static CFTimeInterval g_requestedAt; /* when the fire was queued           */
 
 /* Set right before a wave plays: the ancestor scale the wave offsets must be
  * divided by so the motion keeps its on-screen size.  Read by WaveEngine.m. */
 double W26ScaleComp = 1.0;
 
+static void   w26_forceHomePresentation(void);
 static double w26_effectiveScale(UIView *view);
 static BOOL   w26_homeSettled(void);
 static void   w26_stripForeign(UIView *view);
@@ -346,6 +351,7 @@ static void w26_fire(double velocity, int attempt) {
     [g_engine clearIcons];
 
     w26_loadSettings();
+    w26_forceHomePresentation();
 
     NSArray *icons = w26_collectIconViews();
     if (icons.count == 0) {
@@ -363,8 +369,9 @@ static void w26_fire(double velocity, int attempt) {
     g_lastFireTime = now;
     g_fireDone = YES;
 
-    w26_log(@"fire: +%.2fs after unlock, +%.2fs after cover sheet gone | "
+    w26_log(@"fire: +%.2fs after request, +%.2fs after unlock, +%.2fs after cover sheet gone | "
             @"cfg(delay=%.2f settle=%d scaleComp=%d guard=%.2f)",
+            (g_requestedAt > 0 ? now - g_requestedAt : -1.0),
             (g_unlockedAt > 0 ? now - g_unlockedAt : -1.0),
             (g_lockScreenDismissed > 0 ? now - g_lockScreenDismissed : -1.0),
             g_cfgUnlockDelay, (int)g_cfgWaitSettle, (int)g_cfgScaleComp, g_cfgGuard);
@@ -416,6 +423,35 @@ static void w26_fire(double velocity, int attempt) {
 
     w26_log(@"fire: wave played - %lu icons, dock=%@, velocity=%.1f",
             (unsigned long)icons.count, dock ? @"yes" : @"no", velocity);
+}
+
+/* SpringBoard reveals the home screen gradually during the unlock
+ * (setRootFolderViewControllerPresentationProgress:animated:).  While that
+ * runs the whole icon grid is scaled, which is what made the wave look
+ * "clumped" when it was played early.  Snapping the presentation to its final
+ * value (animated:NO) removes the competing animation AND gives us a settled
+ * grid, so the wave can start immediately instead of after a long wait. */
+static void w26_forceHomePresentation(void) {
+    if (!g_cfgForcePres) return;
+    if (!w26_orig_presentationProgress) {
+        w26_log(@"forcePresentation: hook not installed - skipped");
+        return;
+    }
+
+    Class cls = NSClassFromString(@"SBIconController");
+    if (!cls || ![cls respondsToSelector:@selector(sharedInstance)]) return;
+
+    id controller = [cls sharedInstance];
+    if (!controller) return;
+
+    SEL sel = NSSelectorFromString(
+        @"setRootFolderViewControllerPresentationProgress:animated:completion:");
+    if (![controller respondsToSelector:sel]) return;
+
+    void (*orig)(id, SEL, double, BOOL, id) =
+        (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
+    orig(controller, sel, 1.0, NO, nil);
+    w26_log(@"forced home presentation to 1.0 (animated:NO)");
 }
 
 /* Effective scale of every ancestor of `view`.  During the unlock transition
@@ -494,7 +530,7 @@ static void w26_waitSettleThenFire(double velocity, int attempt, const char *sou
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (now - g_lastFireTime < kW26Debounce) return;
 
-    if (!g_cfgWaitSettle || attempt >= 30 || w26_homeSettled()) {
+    if (!g_cfgWaitSettle || attempt >= 12 || w26_homeSettled()) {
         if (g_cfgWaitSettle) {
             w26_log(@"[%s] home settled after %.2f s", source, attempt * 0.05);
         }
@@ -515,6 +551,7 @@ static void w26_waitSettleThenFire(double velocity, int attempt, const char *sou
 static void w26_requestFire(double velocity, const char *source) {
     if (g_fireDone || g_fireRequested) return;
     g_fireRequested = YES;
+    g_requestedAt = CFAbsoluteTimeGetCurrent();
     w26_loadSettings();
     w26_waitSettleThenFire(velocity, 0, source);
 }
