@@ -12,6 +12,11 @@ name: Build 26Unlock (RootHide)
 
 on:
   workflow_dispatch:
+    inputs:
+      archs:
+        description: 'ARCHS to build (fat = "arm64 arm64e"; A12-only test = "arm64e"; A9-only = "arm64")'
+        required: false
+        default: 'arm64 arm64e'
   push:
     branches:
       - main
@@ -77,8 +82,9 @@ jobs:
       - name: Build roothide package
         working-directory: 26Unlock
         run: |
+          echo "ARCHS = ${{ github.event.inputs.archs || 'arm64 arm64e' }}"
           make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS="arm64 arm64e"
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS="${{ github.event.inputs.archs || 'arm64 arm64e' }}"
 
       - name: Upload package
         uses: actions/upload-artifact@v4
