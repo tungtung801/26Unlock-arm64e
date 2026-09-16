@@ -34,15 +34,41 @@ jobs:
           brew install ldid make
 
       - name: Install RootHide Theos
+        env:
+          # install-sdk queries api.github.com; unauthenticated requests get
+          # rate limited ("ERROR: api.github.com request failed?!").
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
-          echo "--- locate theos ---"
-          ls -d "$HOME/theos" 2>/dev/null || true
-          ls -d "$HOME/.theos" 2>/dev/null || true
-          if   [ -d "$HOME/theos" ];  then echo "THEOS=$HOME/theos"  >> $GITHUB_ENV
-          elif [ -d "$HOME/.theos" ]; then echo "THEOS=$HOME/.theos" >> $GITHUB_ENV
-          else echo "::error::could not locate roothide theos"; exit 1
+          set +e
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)" < /dev/null
+          echo "installer exit code: $?"
+          set -e
+
+          THEOS_DIR="$HOME/theos"
+          [ -d "$THEOS_DIR" ] || THEOS_DIR="$HOME/.theos"
+          if [ ! -d "$THEOS_DIR" ]; then
+            echo "::error::could not locate roothide theos"
+            exit 1
           fi
+          echo "THEOS=$THEOS_DIR" >> $GITHUB_ENV
+          echo "theos: $THEOS_DIR"
+
+          # the SDK step is the fragile one - retry it, then download directly
+          if [ -z "$(ls -A "$THEOS_DIR/sdks" 2>/dev/null)" ]; then
+            echo "::warning::no SDK yet - installing manually with token"
+            mkdir -p "$THEOS_DIR/sdks"
+            "$THEOS_DIR/bin/install-sdk" latest < /dev/null || {
+              echo "install-sdk failed - downloading the SDK directly"
+              url=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                    https://api.github.com/repos/theos/sdks/releases/latest \
+                    | grep -o 'https://[^"]*iPhoneOS[0-9.]*\.sdk\.tar\.xz' \
+                    | sort -V | tail -n1)
+              echo "sdk url: $url"
+              curl -fsSL "$url" | tar -xJ -C "$THEOS_DIR/sdks"
+            }
+          fi
+          echo "--- SDKs ---"
+          ls -A "$THEOS_DIR/sdks"
 
       - name: Remove stale packages
         working-directory: 26Unlock
