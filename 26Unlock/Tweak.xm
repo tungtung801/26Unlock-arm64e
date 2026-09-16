@@ -104,6 +104,33 @@ static const double kW26DeferredDelay    = 0.35;
  * moment so both cases look identical. */
 static const CFTimeInterval kW26PanReFireWindow = 1.5;
 
+/* ------------------------------------------------------------------ */
+#pragma mark - runtime settings (/var/mobile/26Unlock.plist)
+/* ------------------------------------------------------------------ */
+
+#define W26_SETTINGS @"/var/mobile/26Unlock.plist"
+
+/* Every value below can be changed on device without rebuilding: edit
+ * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
+static double g_cfgUnlockDelay = 0.35;  /* delay used on the unlock flow      */
+static BOOL   g_cfgWaitSettle  = NO;    /* wait for the home screen to settle */
+static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
+static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
+
+static void w26_loadSettings(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
+    if (![d isKindOfClass:[NSDictionary class]]) return;
+    id v;
+    v = [d objectForKey:@"UnlockDelay"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgUnlockDelay = [v doubleValue];
+    v = [d objectForKey:@"WaitForSettle"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitSettle  = [v boolValue];
+    v = [d objectForKey:@"ScaleComp"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgScaleComp   = [v boolValue];
+    v = [d objectForKey:@"GuardDuration"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
+}
+
 /* original implementations */
 static IMP w26_orig_setState;
 static IMP w26_orig_hasAnimatedIconLayoutBefore;
@@ -298,6 +325,8 @@ static void w26_fire(double velocity, int attempt) {
     [g_engine reset];
     [g_engine clearIcons];
 
+    w26_loadSettings();
+
     NSArray *icons = w26_collectIconViews();
     if (icons.count == 0) {
         w26_log(@"fire: no icon views yet (attempt %d, iconClass=%@), retrying",
@@ -312,6 +341,13 @@ static void w26_fire(double velocity, int attempt) {
     }
 
     g_lastFireTime = now;
+    g_fireDone = YES;
+
+    w26_log(@"fire: +%.2fs after unlock, +%.2fs after cover sheet gone | "
+            @"cfg(delay=%.2f settle=%d scaleComp=%d guard=%.2f)",
+            (g_unlockedAt > 0 ? now - g_unlockedAt : -1.0),
+            (g_lockScreenDismissed > 0 ? now - g_lockScreenDismissed : -1.0),
+            g_cfgUnlockDelay, (int)g_cfgWaitSettle, (int)g_cfgScaleComp, g_cfgGuard);
 
     /* ---- grid diagnostics (so a "clumped" wave can be diagnosed) ---- */
     {
@@ -330,12 +366,15 @@ static void w26_fire(double velocity, int attempt) {
             int r = (int)((CGRectGetMidY(f) - minY) / ch); if (r < 0) r = 0; if (r > 5) r = 5;
             [cells addObject:[NSString stringWithFormat:@"%d,%d", c, r]];
         }
-        CGAffineTransform t = CGAffineTransformIdentity;
         UIView *first = icons.firstObject;
-        if (first && first.superview) t = first.superview.transform;
-        w26_log(@"grid: bbox=(%.0f,%.0f)-(%.0f,%.0f) cell=%.1fx%.1f cells=%lu/%lu ancestorScale=(%.3f,%.3f)",
+        double eff = first ? w26_effectiveScale(first) : 1.0;
+        w26_log(@"grid: bbox=(%.0f,%.0f)-(%.0f,%.0f) cell=%.1fx%.1f cells=%lu/%lu ancestorScale=%.3f",
                 minX, minY, maxX, maxY, cw, ch,
-                (unsigned long)cells.count, (unsigned long)icons.count, t.a, t.d);
+                (unsigned long)cells.count, (unsigned long)icons.count, eff);
+
+        /* Keep the travelled distance constant on screen even if SpringBoard
+         * currently scales the home screen. */
+        W26ScaleComp = (g_cfgScaleComp && eff > 0.2 && eff < 5.0) ? eff : 1.0;
     }
 
     UIView *dock = w26_findDockView();
@@ -349,41 +388,110 @@ static void w26_fire(double velocity, int attempt) {
 
     [g_engine playWithPullVelocity:velocity];
 
+    if (g_cfgGuard > 0.0) {
+        int ticks = (int)(g_cfgGuard / 0.05);
+        w26_guardTick(icons, ticks);
+        if (dock) w26_guardTick(@[dock], ticks);
+    }
+
     w26_log(@"fire: wave played - %lu icons, dock=%@, velocity=%.1f",
             (unsigned long)icons.count, dock ? @"yes" : @"no", velocity);
 }
 
-/* Fallback triggers (Darwin notification, presentation progress) must NOT fire
- * while the lock screen is still on screen: the home screen has not settled yet
- * and the wave collapses into a clump.  Wait for the cover sheet to disappear
- * first - exactly what the (perfect looking) cover-sheet path does - and only
- * then apply the same 0.35 s delay. */
-static void w26_waitCoverSheetThenFire(double velocity, int attempt, const char *source) {
-    if (g_fireScheduled) return;
-    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - g_lastFireTime < kW26Debounce) return;
-    if (!g_haveCoverClass || !g_onLockScreen) {
-        w26_log(@"[%s] cover sheet already gone - firing in 0.35 s", source);
-        w26_fireDeferred(velocity);
-        return;
+/* Effective scale of every ancestor of `view`.  During the unlock transition
+ * SpringBoard scales the home screen down; a wave played on a scaled grid looks
+ * "clumped" and the dock slide covers less distance (looks slow). */
+static double w26_effectiveScale(UIView *view) {
+    double s = 1.0;
+    UIView *a = view.superview;
+    for (int i = 0; a && i < 12; i++) {
+        CGAffineTransform t = a.transform;
+        double det = t.a * t.d - t.b * t.c;
+        if (det > 0.0001) s *= sqrt(det);
+        a = a.superview;
     }
-    if (attempt >= 25) {
-        w26_log(@"[%s] give up: lock screen never disappeared", source);
-        return;
+    return s;
+}
+
+static BOOL w26_homeSettled(void) {
+    NSArray *icons = w26_collectIconViews();
+    UIView *first = icons.firstObject;
+    if (!first) return NO;
+    if (fabs(w26_effectiveScale(first) - 1.0) > 0.02) return NO;
+    if ([first.layer animationKeys].count > 0) return NO;
+    if (first.superview &&
+        [first.superview.layer animationKeys].count > 0) return NO;
+    return YES;
+}
+
+/* Remove every animation that is NOT ours (ours are keyed "wave26.*"). */
+static void w26_stripForeign(UIView *view) {
+    UIView *a = view;
+    for (int i = 0; a && i < 8; i++) {
+        CALayer *l = a.layer;
+        NSArray *keys = [l animationKeys];
+        if (keys.count) {
+            for (NSString *k in [keys copy]) {
+                if (![k hasPrefix:@"wave26."]) [l removeAnimationForKey:k];
+            }
+        }
+        a = a.superview;
     }
-    g_fireScheduled = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+}
+
+static void w26_guardTick(NSArray *icons, int ticksLeft) {
+    if (ticksLeft <= 0) return;
+    for (UIView *v in icons) w26_stripForeign(v);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        g_fireScheduled = NO;
-        w26_waitCoverSheetThenFire(velocity, attempt + 1, source);
+        w26_guardTick(icons, ticksLeft - 1);
     });
 }
 
+/* The unlock flow is tunable (UnlockDelay / WaitForSettle); the plain
+ * cover-sheet flow (notification centre pulled down and pushed back up) keeps
+ * the 0.35 s delay that already looks right. */
+static double w26_delayForPath(void) {
+    return g_unlockFlow ? g_cfgUnlockDelay : kW26DeferredDelay;
+}
+
 static void w26_fireDeferred(double velocity) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kW26DeferredDelay * NSEC_PER_SEC)),
+    double delay = w26_delayForPath();
+    w26_log(@"schedule fire in %.2f s (unlockFlow=%d, panFired=%d)",
+            delay, (int)g_unlockFlow, (int)g_panFired);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         w26_fire(velocity, 0);
     });
+}
+
+/* Optional pre-delay: wait until the home screen has finished its own
+ * transition so the wave is played on a settled (scale == 1) grid. */
+static void w26_waitSettleThenFire(double velocity, int attempt, const char *source) {
+    if (g_fireScheduled) return;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - g_lastFireTime < kW26Debounce) return;
+
+    if (!g_cfgWaitSettle || attempt >= 30 || w26_homeSettled()) {
+        if (g_cfgWaitSettle) {
+            w26_log(@"[%s] home settled after %.2f s", source, attempt * 0.05);
+        }
+        w26_fireDeferred(velocity);
+        return;
+    }
+
+    g_fireScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        g_fireScheduled = NO;
+        w26_waitSettleThenFire(velocity, attempt + 1, source);
+    });
+}
+
+static void w26_scheduleUnlock(double velocity, const char *source) {
+    if (g_fireDone) return;
+    w26_loadSettings();
+    w26_waitSettleThenFire(velocity, 0, source);
 }
 
 static BOOL w26_isUnlockPan(UIGestureRecognizer *gesture) {
@@ -464,7 +572,7 @@ static void w26_presentationProgress(id self, SEL _cmd, double progress, BOOL an
     if (CFAbsoluteTimeGetCurrent() - g_unlockedAt > 2.5) return;
 
     w26_log(@"home screen fully presented after unlock");
-    w26_waitCoverSheetThenFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, 0, "progress");
+    w26_scheduleUnlock(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "progress");
 }
 
 static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
@@ -474,6 +582,8 @@ static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     }
     g_onLockScreen = YES;
     g_panFired = NO;
+    g_fireDone = NO;
+    g_unlockFlow = NO;
 }
 
 static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
@@ -487,13 +597,17 @@ static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
     g_lockScreenDismissed = CFAbsoluteTimeGetCurrent();
     g_unlockedAt = g_lockScreenDismissed;
 
-    if (g_panFired &&
-        (CFAbsoluteTimeGetCurrent() - g_lastFireTime) < kW26PanReFireWindow) {
-        /* the pan wave is still fresh - do not play twice */
-        return;
+    if (g_fireDone) {
+        /* a wave already played for this flow - unless the pan one was long
+         * ago (swipe up -> type passcode), then a fresh one is wanted */
+        if (!(g_panFired &&
+              (CFAbsoluteTimeGetCurrent() - g_lastFireTime) >= kW26PanReFireWindow)) {
+            return;
+        }
+        g_fireDone = NO;
     }
 
-    w26_log(@"cover sheet disappeared (panFired=%d, lastFire=%.2fs ago) - firing in 0.35 s",
+    w26_log(@"cover sheet disappeared (panFired=%d, lastFire=%.2fs ago)",
             (int)g_panFired, CFAbsoluteTimeGetCurrent() - g_lastFireTime);
     w26_fireDeferred(g_haveVel ? g_lastVel.y : kW26DefaultVelocity);
 }
@@ -570,6 +684,8 @@ static void w26_registerLockStateNotifications(void) {
         if (state == 1) {           /* locked again - re-arm */
             g_onLockScreen = YES;
             g_panFired = NO;
+            g_fireDone = NO;
+            g_unlockFlow = NO;
             return;
         }
 
@@ -580,7 +696,8 @@ static void w26_registerLockStateNotifications(void) {
         if (g_panFired) return;
 
         w26_log(@"unlocked without a pan");
-        w26_waitCoverSheetThenFire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, 0, "notify");
+        g_unlockFlow = YES;
+        w26_scheduleUnlock(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, "notify");
     });
 }
 

@@ -8,6 +8,11 @@ static NSString * const kKeyPos   = @"wave26.pos";
 static NSString * const kKeyPosX  = @"wave26.posx";
 static NSString * const kKeyPosY  = @"wave26.posy";
 static NSString * const kKeyScale = @"wave26.scale";
+
+/* Set by Tweak.xm right before a wave plays: when SpringBoard scales the home
+ * screen (unlock transition) every offset must be divided by that scale so the
+ * icons still travel the same distance on screen.  1.0 == no compensation. */
+extern double W26ScaleComp;
 static NSString * const kKeyDock  = @"wave26.dock";
 
 static const CGFloat kSpringMass = 1.5;
@@ -257,8 +262,8 @@ static const CGFloat kSpringMass = 1.5;
         );
     } else {
         target = CGPointMake(
-            original.x + dx * 800.0,
-            original.y + dy * 800.0
+            original.x + dx * 800.0 / W26ScaleComp,
+            original.y + dy * 800.0 / W26ScaleComp
         );
     }
 
@@ -320,7 +325,7 @@ static const CGFloat kSpringMass = 1.5;
      * The previous reconstruction had these two swapped, which made the dock
      * slide DOWN and snap back - the "dock appears abruptly / jerks" bug. */
     CGPoint target =
-        CGPointMake(original.x, original.y + 380.0);
+        CGPointMake(original.x, original.y + 380.0 / W26ScaleComp);
 
     CFTimeInterval beginTime =
         [layer convertTime:CACurrentMediaTime() fromLayer:nil];
