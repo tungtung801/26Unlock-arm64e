@@ -47,6 +47,20 @@ static const CGFloat kSpringMass = 1.5;
     [self.icons addObject:icon];
 }
 
+- (void)setHomeOverride:(CGPoint)home forView:(UIView *)view {
+    if (!view) return;
+
+    for (WaveIcon *icon in self.icons) {
+        if (icon.view == view) {
+            icon.hasHomeOverrideX = YES;
+            icon.homeOverrideX = home.x;
+            icon.hasHomeOverrideY = YES;
+            icon.homeOverrideY = home.y;
+            return;
+        }
+    }
+}
+
 - (void)clearIcons {
     [self.icons removeAllObjects];
 }
@@ -194,6 +208,10 @@ static const CGFloat kSpringMass = 1.5;
 
     if (icon.hasHomeOverrideX) {
         original.x = icon.homeOverrideX;
+    }
+
+    if (icon.hasHomeOverrideY) {
+        original.y = icon.homeOverrideY;
     }
 
     if (icon.row == 5) {

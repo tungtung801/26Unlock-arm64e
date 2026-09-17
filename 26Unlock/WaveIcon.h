@@ -6,5 +6,7 @@
 @property(nonatomic) NSInteger row;
 @property(nonatomic) BOOL hasHomeOverrideX;
 @property(nonatomic) double homeOverrideX;
+@property(nonatomic) BOOL hasHomeOverrideY;
+@property(nonatomic) double homeOverrideY;
 @property(nonatomic) BOOL horizontalFly;
 @end

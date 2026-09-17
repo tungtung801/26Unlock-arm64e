@@ -4,6 +4,8 @@
 <dict>
 	<key>UnlockDelay</key>
 	<real>0.0</real>
+	<key>WaitForStable</key>
+	<false/>
 	<key>StableSamples</key>
 	<integer>1</integer>
 	<key>GridMinWidth</key>

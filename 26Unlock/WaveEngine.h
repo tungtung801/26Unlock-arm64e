@@ -5,6 +5,9 @@
 @property(nonatomic, strong) NSMutableArray<WaveIcon *> *icons;
 @property(nonatomic, weak) UIView *dock;
 - (void)registerIcon:(UIView *)view col:(NSInteger)col row:(NSInteger)row;
+/* Force an icon to land at this point (in its own layer coordinate space)
+ * instead of at the position SpringBoard currently has it at. */
+- (void)setHomeOverride:(CGPoint)home forView:(UIView *)view;
 - (void)clearIcons;
 - (void)setDockView:(UIView *)dock;
 - (void)playWithPullVelocity:(double)pullVelocity;

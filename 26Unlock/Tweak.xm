@@ -96,7 +96,7 @@ static CFTimeInterval g_lastFireTime;
 static CFTimeInterval g_lockScreenDismissed;
 static CFTimeInterval g_unlockedAt;
 
-static const CFTimeInterval kW26Debounce = 0.25;
+static const CFTimeInterval kW26Debounce = 0.15;
 static const double kW26DefaultVelocity  = -1250.0;
 /* If the pan already played a wave but the unlock only finished much later
  * (passcode typing takes seconds), play a fresh one at the cover-sheet
@@ -117,6 +117,7 @@ static double g_cfgUnlockDelay = 0.00;  /* settle delay - 0 = fire as soon as  *
                                         /* the layout is ready (no dead time) */
 static int    g_cfgStableSamp  = 1;     /* identical samples before firing    */
 static BOOL   g_cfgPinPres     = YES;   /* suppress SpringBoard's own reveal  */
+static BOOL   g_cfgWaitStable  = NO;    /* wait for the grid to stop moving   */
 static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
 static BOOL   g_cfgWaitCover   = NO;   /* wait until the lock screen is gone */
 static BOOL   g_cfgWaitGrid    = YES;   /* wait until the icon grid is at home*/
@@ -137,6 +138,8 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgScaleComp   = [v boolValue];
     v = [d objectForKey:@"GuardDuration"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
+    v = [d objectForKey:@"WaitForStable"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitStable  = [v boolValue];
     v = [d objectForKey:@"PinPresentation"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgPinPres     = [v boolValue];
     v = [d objectForKey:@"StableSamples"];
@@ -167,10 +170,9 @@ static BOOL     g_coverSheetGone;   /* SBCoverSheetViewController dismissed  */
 static BOOL     g_presComplete;     /* no home presentation pending          */
 static int      g_stableSamples;    /* consecutive identical layout samples  */
 static NSMutableArray *g_prevCenters;
-static NSMutableArray *g_homeCenters;   /* icon centres captured while idle   */
+static NSMapTable *g_homeMap;           /* UIView * -> home centre (window)   */
 
 static void w26_captureHomeLayout(void);
-static BOOL w26_layoutMatchesHome(NSArray *icons);
 
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason);
 static void w26_retry(int attempt, uint64_t cycle, const char *reason);
@@ -370,6 +372,18 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
         if (row < 0) row = 0; else if (row > 5) row = 5;
 
         [g_engine registerIcon:view col:col row:row];
+
+        /* If this icon's true home is known (recorded while the phone was
+         * locked), make the wave land THERE instead of at the condensed
+         * position SpringBoard is currently holding it at.  This is what
+         * removes the clump without having to wait for the reveal. */
+        NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
+        if (homeVal && view.superview) {
+            CGPoint homeWindow = [homeVal CGPointValue];
+            CGPoint homeLocal  = [view.superview convertPoint:homeWindow
+                                                     fromView:nil];
+            [g_engine setHomeOverride:homeLocal forView:view];
+        }
     }
 }
 
@@ -590,7 +604,10 @@ static void w26_retry(int attempt, uint64_t cycle, const char *reason) {
 }
 
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
-    if (cycle != g_cycleID) return;          /* device locked again -> stale */
+    if (cycle != g_cycleID) {                /* device locked again -> stale */
+        g_fireRequested = NO;                /* never leave the flag stuck   */
+        return;
+    }
     if (g_fireDone) return;
 
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
@@ -614,25 +631,22 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     if (strict) {
         NSArray *icons = w26_collectIconViews();
 
-        /* 3a. exact match with the layout recorded while the phone was locked
-         *     (works on every iOS version, whatever it does while revealing) */
-        if (g_homeCenters && !w26_layoutMatchesHome(icons) && !giveUp) {
-            if (attempt == 0) w26_log(@"[%s] icons not back at home layout yet", reason);
-            w26_retry(attempt, cycle, reason);
-            return;
+        /* Waiting for the icons to come to rest guarantees a clean grid but
+         * costs the length of SpringBoard's reveal, and by then the stock
+         * animation has already been seen.  The home override makes the wave
+         * land correctly even when it starts early, so waiting is off by
+         * default and can be switched back on with WaitForStable. */
+        if (g_cfgWaitStable && !g_pinPresentation) {
+            if (!w26_iconLayoutStable(icons) && !giveUp) {
+                w26_retry(attempt, cycle, reason);
+                return;
+            }
         }
-        /* 3b. no reference available: fall back to the width heuristic */
-        if (!g_homeCenters && g_cfgWaitGrid &&
+        /* No recorded home layout at all (first unlock right after a
+         * respring): fall back to the width heuristic. */
+        if (!g_homeMap && g_cfgWaitGrid &&
             !w26_iconsHaveValidFrames(icons) && !giveUp) {
             if (attempt == 0) w26_log(@"[%s] icon frames not valid yet", reason);
-            w26_retry(attempt, cycle, reason);
-            return;
-        }
-        /* 4. the layout must have stopped moving.  While the pin is active
-         *    SpringBoard cannot move the icons any more, so there is nothing
-         *    to wait for and the wave can start on the first valid sample. */
-        BOOL needStable = !g_pinPresentation;
-        if (needStable && !w26_iconLayoutStable(icons) && !giveUp) {
             w26_retry(attempt, cycle, reason);
             return;
         }
@@ -655,7 +669,7 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
         w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d home=%d",
                 reason, now - g_requestedAt, attempt,
                 g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
-                (int)g_pinPresentation, (int)(g_homeCenters != nil));
+                (int)g_pinPresentation, (int)(g_homeMap != nil));
     }
 
     g_fireRequested = NO;
@@ -670,7 +684,11 @@ static void w26_requestWaveCheck(const char *reason) {
         (CFAbsoluteTimeGetCurrent() - g_lastFireTime) > 0.25) {
         w26_armCycle("re-arm (no lock cycle)");
     }
-    if (g_fireDone || g_fireRequested) return;
+    if (g_fireDone || g_fireRequested) {
+        w26_log(@"wave request skipped (%s) fireDone=%d requested=%d",
+                reason, (int)g_fireDone, (int)g_fireRequested);
+        return;
+    }
 
     g_fireRequested = YES;
     g_requestedAt   = CFAbsoluteTimeGetCurrent();
@@ -723,27 +741,16 @@ static void w26_captureHomeLayout(void) {
     NSArray *icons = w26_collectIconViews();
     if (icons.count < 2) return;
 
-    NSMutableArray *c = [NSMutableArray arrayWithCapacity:icons.count];
+    /* Keyed by the view itself and weak, so dead icons simply disappear and
+     * the order of collection can never matter. */
+    NSMapTable *m = [NSMapTable weakToStrongObjectsMapTable];
     for (UIView *v in icons) {
         CGRect f = [v convertRect:v.bounds toView:nil];
-        [c addObject:[NSValue valueWithCGPoint:
-            CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f))]];
+        [m setObject:[NSValue valueWithCGPoint:
+            CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f))] forKey:v];
     }
-    g_homeCenters = c;
+    g_homeMap = m;
     w26_log(@"home layout captured (%lu icons)", (unsigned long)icons.count);
-}
-
-static BOOL w26_layoutMatchesHome(NSArray *icons) {
-    if (!g_homeCenters || g_homeCenters.count != icons.count) return NO;
-
-    for (NSUInteger i = 0; i < icons.count; i++) {
-        UIView *v = [icons objectAtIndex:i];
-        CGRect f = [v convertRect:v.bounds toView:nil];
-        CGPoint h = [[g_homeCenters objectAtIndex:i] CGPointValue];
-        if (fabs(CGRectGetMidX(f) - h.x) > 1.5) return NO;
-        if (fabs(CGRectGetMidY(f) - h.y) > 1.5) return NO;
-    }
-    return YES;
 }
 
 static BOOL w26_iconLayoutStable(NSArray *icons) {
