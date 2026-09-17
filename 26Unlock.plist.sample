@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>UnlockDelay</key>
+	<real>0.0</real>
+	<key>StableSamples</key>
+	<integer>1</integer>
+	<key>GridMinWidth</key>
+	<real>0.5</real>
+	<key>WaitForGrid</key>
+	<true/>
+	<key>WaitForCoverSheet</key>
+	<false/>
+	<key>PinPresentation</key>
+	<true/>
+	<key>ScaleComp</key>
+	<true/>
+	<key>GuardDuration</key>
+	<real>0.6</real>
+	<key>ForcePresentation</key>
+	<true/>
+</dict>
+</plist>
