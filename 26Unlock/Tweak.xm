@@ -96,7 +96,7 @@ static CFTimeInterval g_lastFireTime;
 static CFTimeInterval g_lockScreenDismissed;
 static CFTimeInterval g_unlockedAt;
 
-static const CFTimeInterval kW26Debounce = 0.3;
+static const CFTimeInterval kW26Debounce = 0.25;
 static const double kW26DefaultVelocity  = -1250.0;
 /* If the pan already played a wave but the unlock only finished much later
  * (passcode typing takes seconds), play a fresh one at the cover-sheet
@@ -167,6 +167,10 @@ static BOOL     g_coverSheetGone;   /* SBCoverSheetViewController dismissed  */
 static BOOL     g_presComplete;     /* no home presentation pending          */
 static int      g_stableSamples;    /* consecutive identical layout samples  */
 static NSMutableArray *g_prevCenters;
+static NSMutableArray *g_homeCenters;   /* icon centres captured while idle   */
+
+static void w26_captureHomeLayout(void);
+static BOOL w26_layoutMatchesHome(NSArray *icons);
 
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason);
 static void w26_retry(int attempt, uint64_t cycle, const char *reason);
@@ -603,21 +607,35 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
         return;
     }
 
-    NSArray *icons = w26_collectIconViews();
+    /* The notification-centre flow is not an unlock: the grid is already at
+     * rest, so there is nothing to wait for - it must always play. */
+    BOOL strict = g_unlockConfirmed;
 
-    /* 3. real, on-screen frames - a condensed grid is not valid */
-    if (g_cfgWaitGrid && !w26_iconsHaveValidFrames(icons) && !giveUp) {
-        if (attempt == 0) w26_log(@"[%s] icon frames not valid yet", reason);
-        w26_retry(attempt, cycle, reason);
-        return;
-    }
-    /* 4. the layout must have stopped moving.  While the pin is active
-     *    SpringBoard cannot move the icons any more, so there is nothing to
-     *    wait for and the wave can start on the first valid sample. */
-    BOOL needStable = !g_pinPresentation;
-    if (needStable && !w26_iconLayoutStable(icons) && !giveUp) {
-        w26_retry(attempt, cycle, reason);
-        return;
+    if (strict) {
+        NSArray *icons = w26_collectIconViews();
+
+        /* 3a. exact match with the layout recorded while the phone was locked
+         *     (works on every iOS version, whatever it does while revealing) */
+        if (g_homeCenters && !w26_layoutMatchesHome(icons) && !giveUp) {
+            if (attempt == 0) w26_log(@"[%s] icons not back at home layout yet", reason);
+            w26_retry(attempt, cycle, reason);
+            return;
+        }
+        /* 3b. no reference available: fall back to the width heuristic */
+        if (!g_homeCenters && g_cfgWaitGrid &&
+            !w26_iconsHaveValidFrames(icons) && !giveUp) {
+            if (attempt == 0) w26_log(@"[%s] icon frames not valid yet", reason);
+            w26_retry(attempt, cycle, reason);
+            return;
+        }
+        /* 4. the layout must have stopped moving.  While the pin is active
+         *    SpringBoard cannot move the icons any more, so there is nothing
+         *    to wait for and the wave can start on the first valid sample. */
+        BOOL needStable = !g_pinPresentation;
+        if (needStable && !w26_iconLayoutStable(icons) && !giveUp) {
+            w26_retry(attempt, cycle, reason);
+            return;
+        }
     }
     /* 4b. optional: only start once the lock screen has actually gone */
     if (g_cfgWaitCover && !g_coverSheetGone && !giveUp) {
@@ -634,10 +652,10 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     if (giveUp) {
         w26_log(@"[%s] gave up waiting for a stable layout", reason);
     } else {
-        w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d",
+        w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d home=%d",
                 reason, now - g_requestedAt, attempt,
                 g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
-                (int)g_pinPresentation);
+                (int)g_pinPresentation, (int)(g_homeCenters != nil));
     }
 
     g_fireRequested = NO;
@@ -649,7 +667,7 @@ static void w26_requestWaveCheck(const char *reason) {
      * a lock cycle in between, so the "already played" flag has to be cleared
      * or a quick second swipe would silently do nothing. */
     if (g_fireDone && !g_unlockConfirmed &&
-        (CFAbsoluteTimeGetCurrent() - g_lastFireTime) > 0.6) {
+        (CFAbsoluteTimeGetCurrent() - g_lastFireTime) > 0.25) {
         w26_armCycle("re-arm (no lock cycle)");
     }
     if (g_fireDone || g_fireRequested) return;
@@ -695,6 +713,37 @@ static BOOL w26_iconsHaveValidFrames(NSArray *icons) {
 
     double span = maxX - minX;
     return (bounds.size.width > 0) && (span >= g_cfgGridMin * bounds.size.width);
+}
+
+/* When the device locks, the home screen is at rest and the icon grid is at
+ * its true home positions.  Remembering that layout gives an exact reference
+ * for "the icons are home", whatever mechanism a given iOS version uses to
+ * condense them during the unlock. */
+static void w26_captureHomeLayout(void) {
+    NSArray *icons = w26_collectIconViews();
+    if (icons.count < 2) return;
+
+    NSMutableArray *c = [NSMutableArray arrayWithCapacity:icons.count];
+    for (UIView *v in icons) {
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        [c addObject:[NSValue valueWithCGPoint:
+            CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f))]];
+    }
+    g_homeCenters = c;
+    w26_log(@"home layout captured (%lu icons)", (unsigned long)icons.count);
+}
+
+static BOOL w26_layoutMatchesHome(NSArray *icons) {
+    if (!g_homeCenters || g_homeCenters.count != icons.count) return NO;
+
+    for (NSUInteger i = 0; i < icons.count; i++) {
+        UIView *v = [icons objectAtIndex:i];
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        CGPoint h = [[g_homeCenters objectAtIndex:i] CGPointValue];
+        if (fabs(CGRectGetMidX(f) - h.x) > 1.5) return NO;
+        if (fabs(CGRectGetMidY(f) - h.y) > 1.5) return NO;
+    }
+    return YES;
 }
 
 static BOOL w26_iconLayoutStable(NSArray *icons) {
@@ -880,6 +929,7 @@ static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
         orig(self, _cmd, animated);
     }
     g_onLockScreen = YES;
+    w26_captureHomeLayout();           /* home screen is at rest now */
     w26_armCycle("cover appeared");
 }
 
@@ -977,6 +1027,7 @@ static void w26_registerLockStateNotifications(void) {
 
         if (state == 1) {           /* locked again - re-arm the cycle */
             g_onLockScreen = YES;
+            w26_captureHomeLayout();   /* home screen is at rest now */
             w26_armCycle("locked");
             return;
         }
@@ -1006,6 +1057,13 @@ static void w26_init(void) {
     /* Nothing is being presented until SpringBoard says otherwise, so the
      * very first unlock after a respring must start from a clean cycle. */
     w26_armCycle("boot");
+
+    /* Give SpringBoard a moment to finish its own respring layout, then
+     * record the home positions. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        w26_captureHomeLayout();
+    });
 
     w26_log(@"==== 26Unlock loaded (no substrate) ====");
     w26_log(@"iOS %@ | pan=%@ | edge=%@ | icon=%@ | dock=%@ | coverSheetClass=%@",
