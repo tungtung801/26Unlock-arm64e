@@ -96,7 +96,7 @@ static CFTimeInterval g_lastFireTime;
 static CFTimeInterval g_lockScreenDismissed;
 static CFTimeInterval g_unlockedAt;
 
-static const CFTimeInterval kW26Debounce = 0.5;
+static const CFTimeInterval kW26Debounce = 0.3;
 static const double kW26DefaultVelocity  = -1250.0;
 /* If the pan already played a wave but the unlock only finished much later
  * (passcode typing takes seconds), play a fresh one at the cover-sheet
@@ -634,8 +634,10 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     if (giveUp) {
         w26_log(@"[%s] gave up waiting for a stable layout", reason);
     } else {
-        w26_log(@"[%s] ready after %.2f s (%d samples)",
-                reason, now - g_requestedAt, attempt);
+        w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d",
+                reason, now - g_requestedAt, attempt,
+                g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
+                (int)g_pinPresentation);
     }
 
     g_fireRequested = NO;
@@ -643,6 +645,13 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
 }
 
 static void w26_requestWaveCheck(const char *reason) {
+    /* The notification centre can be pulled down and dismissed again without
+     * a lock cycle in between, so the "already played" flag has to be cleared
+     * or a quick second swipe would silently do nothing. */
+    if (g_fireDone && !g_unlockConfirmed &&
+        (CFAbsoluteTimeGetCurrent() - g_lastFireTime) > 0.6) {
+        w26_armCycle("re-arm (no lock cycle)");
+    }
     if (g_fireDone || g_fireRequested) return;
 
     g_fireRequested = YES;
@@ -802,7 +811,17 @@ static void w26_presWithCompletion(id self, SEL _cmd, double progress, BOOL anim
     if (w26_orig_presentationProgress) {
         void (*orig)(id, SEL, double, BOOL, id) =
             (void (*)(id, SEL, double, BOOL, id))w26_orig_presentationProgress;
-        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO, completion);
+
+        if (g_pinPresentation) {
+            /* The home screen is already pinned at its final state, so
+             * SpringBoard's per-frame updates are pointless work: they force a
+             * layout pass every frame (dropped frames) and keep rewriting the
+             * icon positions our wave is animating (the stutter on rows 3+).
+             * Only the final value is allowed through. */
+            if (progress >= 0.999) orig(self, _cmd, 1.0, NO, completion);
+        } else {
+            orig(self, _cmd, progress, NO, completion);
+        }
     }
     w26_presProgressReached(progress);
 }
@@ -811,7 +830,12 @@ static void w26_presNoCompletion(id self, SEL _cmd, double progress, BOOL animat
     if (w26_orig_presentationProgress) {
         void (*orig)(id, SEL, double, BOOL) =
             (void (*)(id, SEL, double, BOOL))w26_orig_presentationProgress;
-        orig(self, _cmd, g_pinPresentation ? 1.0 : progress, NO);
+
+        if (g_pinPresentation) {
+            if (progress >= 0.999) orig(self, _cmd, 1.0, NO);
+        } else {
+            orig(self, _cmd, progress, NO);
+        }
     }
     w26_presProgressReached(progress);
 }
