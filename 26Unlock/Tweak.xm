@@ -113,9 +113,9 @@ static const int            kW26MaxAttempts     = 20;    /* 20 * 0.06 = 1.2 s */
 
 /* Every value below can be changed on device without rebuilding: edit
  * /var/mobile/26Unlock.plist with Filza, then simply unlock again. */
-static double g_cfgUnlockDelay = 0.35;  /* settle delay - the notification    */
-                                        /* centre timing that looks right     */
-static int    g_cfgStableSamp  = 2;     /* identical samples before firing    */
+static double g_cfgUnlockDelay = 0.00;  /* settle delay - 0 = fire as soon as  */
+                                        /* the layout is ready (no dead time) */
+static int    g_cfgStableSamp  = 1;     /* identical samples before firing    */
 static BOOL   g_cfgPinPres     = YES;   /* suppress SpringBoard's own reveal  */
 static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
 static BOOL   g_cfgWaitCover   = NO;   /* wait until the lock screen is gone */
@@ -611,8 +611,11 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
         w26_retry(attempt, cycle, reason);
         return;
     }
-    /* 4. the layout must have stopped moving */
-    if (!w26_iconLayoutStable(icons) && !giveUp) {
+    /* 4. the layout must have stopped moving.  While the pin is active
+     *    SpringBoard cannot move the icons any more, so there is nothing to
+     *    wait for and the wave can start on the first valid sample. */
+    BOOL needStable = !g_pinPresentation;
+    if (needStable && !w26_iconLayoutStable(icons) && !giveUp) {
         w26_retry(attempt, cycle, reason);
         return;
     }

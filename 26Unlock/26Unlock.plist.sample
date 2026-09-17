@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>UnlockDelay</key>
-	<real>0.35</real>
+	<real>0.0</real>
 	<key>StableSamples</key>
-	<integer>2</integer>
+	<integer>1</integer>
 	<key>GridMinWidth</key>
 	<real>0.5</real>
 	<key>WaitForGrid</key>
