@@ -98,7 +98,6 @@ static CFTimeInterval g_unlockedAt;
 
 static const CFTimeInterval kW26Debounce = 0.5;
 static const double kW26DefaultVelocity  = -1250.0;
-static const double kW26DeferredDelay    = 0.35;
 /* If the pan already played a wave but the unlock only finished much later
  * (passcode typing takes seconds), play a fresh one at the cover-sheet
  * moment so both cases look identical. */
@@ -156,9 +155,7 @@ static void w26_loadSettings(void) {
 #pragma mark - flow state / forward declarations
 /* ------------------------------------------------------------------ */
 
-static BOOL g_fireScheduled;   /* a fire is already pending              */
 static BOOL g_fireDone;        /* a wave already played for this flow    */
-static BOOL g_unlockFlow;      /* cover sheet going away == unlock       */
 static BOOL g_fireRequested;   /* a fire is already queued               */
 static BOOL g_pinPresentation; /* keep progress pinned at 1.0             */
 
