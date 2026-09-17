@@ -3,15 +3,17 @@
 <plist version="1.0">
 <dict>
 	<key>UnlockDelay</key>
-	<real>0.0</real>
-	<key>WaitForCoverSheet</key>
-	<false/>
-	<key>WaitForGrid</key>
-	<true/>
+	<real>0.35</real>
+	<key>StableSamples</key>
+	<integer>2</integer>
 	<key>GridMinWidth</key>
 	<real>0.5</real>
-	<key>WaitForSettle</key>
+	<key>WaitForGrid</key>
+	<true/>
+	<key>WaitForCoverSheet</key>
 	<false/>
+	<key>PinPresentation</key>
+	<true/>
 	<key>ScaleComp</key>
 	<true/>
 	<key>GuardDuration</key>
