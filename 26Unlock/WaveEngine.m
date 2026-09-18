@@ -354,7 +354,7 @@ static const CGFloat kSpringMass = 1.5;
 
     double travel    = W26DockTravel    > 1.0  ? W26DockTravel    : 380.0;
     double stiffness = W26DockStiffness > 1.0  ? W26DockStiffness : 200.0;
-    double damping   = W26DockDamping   > 1.0  ? W26DockDamping   : 22.0;
+    double damping   = W26DockDamping   > 1.0  ? W26DockDamping   : 28.0;
     double mass      = W26DockMass      > 0.05 ? W26DockMass      : 1.0;
 
     double scale = (W26ScaleComp > 0.2 && W26ScaleComp < 5.0) ? W26ScaleComp : 1.0;

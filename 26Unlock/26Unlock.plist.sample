@@ -21,7 +21,7 @@
 	<key>DockStiffness</key>
 	<real>200.0</real>
 	<key>DockDamping</key>
-	<real>22.0</real>
+	<real>28.0</real>
 	<key>DockMass</key>
 	<real>1.0</real>
 	<key>GuardDuration</key>

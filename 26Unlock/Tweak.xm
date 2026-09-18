@@ -126,11 +126,14 @@ static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
 
+/* Read by WaveEngine.m.  W26ScaleComp = the ancestor scale the wave offsets
+ * are divided by so the motion keeps its on-screen size.  The dock spring is
+ * tunable at runtime through 26Unlock.plist - no rebuild needed. */
 double W26ScaleComp = 1.0;
-double W26DockTravel    = 380.0;   /* pt below home - binary value         */
-double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, too slow       */
-double W26DockDamping   = 22.0;    /* binary value, kept                   */
-double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.36s  */
+double W26DockTravel    = 380.0;   /* pt below home (binary value)          */
+double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, far too slow    */
+double W26DockDamping   = 28.0;    /* binary 22 -> ~3pt bounce; 28 = clean  */
+double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.29s   */
 
 static void w26_loadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
@@ -193,9 +196,6 @@ static BOOL w26_iconsHaveValidFrames(NSArray *icons);
 static BOOL w26_iconLayoutStable(NSArray *icons);
 static CFTimeInterval g_requestedAt; /* when the fire was queued           */
 
-/* Set right before a wave plays: the ancestor scale the wave offsets must be
- * divided by so the motion keeps its on-screen size.  Read by WaveEngine.m. */
-double W26ScaleComp = 1.0;
 
 static void   w26_forceHomePresentation(void);
 static BOOL   w26_swizzle(Class cls, SEL sel, IMP replacement, IMP *original);
