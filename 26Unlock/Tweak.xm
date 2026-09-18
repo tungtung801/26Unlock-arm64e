@@ -138,11 +138,12 @@ double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.29s   */
 /* Unlock straight into a running app (not the home screen). */
 static BOOL   g_cfgAppZoom       = YES;   /* zoom-out + clearing blur        */
 static double g_cfgAppZoomScale  = 1.12;  /* start scale -> 1.0              */
-static double g_cfgAppZoomDur    = 0.11;  /* seconds                         */
+static double g_cfgAppZoomDur    = 0.24;  /* 0.11 = 6 frames @60Hz = flicker */
 static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
 static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
-static double g_cfgAppZoomDelay  = 0.02;  /* let the lock screen clear first */
+static double g_cfgAppZoomDelay  = 0.06;  /* let the lock screen clear first */
 static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
+static BOOL   g_cfgAppZoomBlur   = YES;   /* set NO to drop the blur entirely*/
 
 static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
 static BOOL     g_appZoomPlayed;
@@ -178,6 +179,8 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomLevel = [v doubleValue];
     v = [d objectForKey:@"AppZoomSnapshotDelay"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomDelay = [v doubleValue];
+    v = [d objectForKey:@"AppZoomBlur"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomBlur   = [v boolValue];
     v = [d objectForKey:@"AppZoomEarlyBlur"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomEarly = [v boolValue];
     v = [d objectForKey:@"DockTravel"];
@@ -811,13 +814,15 @@ static void w26_appZoomBegin(void) {
      * own alpha is unreliable, animating its container is not. */
     UIView *host = [[UIView alloc] initWithFrame:b];
     host.backgroundColor = [UIColor clearColor];
-    UIBlurEffect *fx =
-        [UIBlurEffect effectWithStyle:(UIBlurEffectStyle)g_cfgAppZoomStyle];
-    UIVisualEffectView *fxv = [[UIVisualEffectView alloc] initWithEffect:fx];
-    fxv.frame = b;
-    fxv.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [host addSubview:fxv];
+    if (g_cfgAppZoomBlur) {
+        UIBlurEffect *fx =
+            [UIBlurEffect effectWithStyle:(UIBlurEffectStyle)g_cfgAppZoomStyle];
+        UIVisualEffectView *fxv = [[UIVisualEffectView alloc] initWithEffect:fx];
+        fxv.frame = b;
+        fxv.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [host addSubview:fxv];
+    }
     [w addSubview:host];
     g_zoomBlurHost = host;
 
@@ -827,6 +832,10 @@ static void w26_appZoomBegin(void) {
 static void w26_appZoomPlay(void) {
     if (!g_appZoomFlow || g_appZoomPlayed) return;
     g_appZoomPlayed = YES;
+
+    /* Re-read the settings here too: this path never goes through w26_fire,
+     * so without this every AppZoom* knob needed a respring. */
+    w26_loadSettings();
 
     CGRect b = [UIScreen mainScreen].bounds;
     if (CGRectIsEmpty(b)) { w26_appZoomTeardown(); return; }
@@ -864,19 +873,23 @@ static void w26_appZoomPlay(void) {
         [g_zoomWindow insertSubview:snap belowSubview:g_zoomBlurHost];
         g_zoomSnap = snap;
 
-        w26_log(@"[appzoom] play: scale=%.3f dur=%.3f",
-                g_cfgAppZoomScale, g_cfgAppZoomDur);
+        w26_log(@"[appzoom] play: scale=%.3f dur=%.3f blur=%d",
+                g_cfgAppZoomScale, g_cfgAppZoomDur, (int)g_cfgAppZoomBlur);
 
-        [UIView animateWithDuration:g_cfgAppZoomDur
-                              delay:0
-                            options:UIViewAnimationOptionCurveEaseOut
-                         animations:^{
-            snap.transform = CGAffineTransformIdentity;
-            g_zoomBlurHost.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            w26_appZoomTeardown();
-            w26_log(@"[appzoom] done");
-        }];
+        /* A brand new UIVisualEffectView can come up blank for one frame.
+         * Let it render first, otherwise that blank frame is the flicker. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:g_cfgAppZoomDur
+                                  delay:0
+                                options:UIViewAnimationOptionCurveEaseOut
+                             animations:^{
+                snap.transform = CGAffineTransformIdentity;
+                g_zoomBlurHost.alpha = 0.0;
+            } completion:^(BOOL finished) {
+                w26_appZoomTeardown();
+                w26_log(@"[appzoom] done");
+            }];
+        });
     });
 }
 
