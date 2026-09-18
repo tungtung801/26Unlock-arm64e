@@ -143,6 +143,7 @@ static double g_cfgAppZoomDamp   = 28.0;  /* >2*sqrt(stiffness*mass) = no bounce
 static double g_cfgAppZoomStiff  = 180.0;
 static double g_cfgAppZoomMassV  = 1.0;
 static BOOL   g_cfgAppZoomHide   = YES;   /* hide the lock screen while shooting */
+static BOOL   g_cfgAppZoomNow    = YES;   /* YES = capture AFTER the hide took   */
 static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
 static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
 static double g_cfgAppZoomDelay  = 0.05;  /* the sheet is hidden, not awaited */
@@ -190,6 +191,8 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomStiff  = [v doubleValue];
     v = [d objectForKey:@"AppZoomMass"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomMassV  = [v doubleValue];
+    v = [d objectForKey:@"AppZoomSnapshotUpdates"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomNow    = [v boolValue];
     v = [d objectForKey:@"AppZoomHideSheetForSnapshot"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHide   = [v boolValue];
     v = [d objectForKey:@"AppZoomBlur"];
@@ -924,14 +927,24 @@ static void w26_appZoomPlay(void) {
                 if (!cw.hidden && cw.windowLevel >= g_coverWindowLevel - 1.0) {
                     cw.hidden = YES;
                     [hidden addObject:cw];
+                    w26_log(@"[appzoom] hiding %@ (level=%.0f)",
+                            NSStringFromClass([cw class]), cw.windowLevel);
                 }
             }
         }
 
+        /* NO would hand back the PREVIOUS commit - i.e. the frame from
+         * before the lock screen was hidden, which is exactly the ghost
+         * left over the keyboard.  YES renders the current state. */
         UIView *snap = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
+        if (g_cfgAppZoomNow) {
+            snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES];
+        }
+        if (!snap) {
+            snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
+        }
 #pragma clang diagnostic pop
 
         for (UIWindow *cw in hidden) cw.hidden = NO;
@@ -939,6 +952,8 @@ static void w26_appZoomPlay(void) {
             w26_log(@"[appzoom] hid %lu lock-screen window(s) for the capture",
                     (unsigned long)hidden.count);
         }
+        w26_log(@"[appzoom] capture: mode=%s ok=%d",
+                g_cfgAppZoomNow ? "current(YES)" : "previous(NO)", (int)(snap != nil));
 
         if (wasVisible && g_zoomWindow) g_zoomWindow.hidden = NO;
 

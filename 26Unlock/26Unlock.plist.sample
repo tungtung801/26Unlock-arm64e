@@ -28,6 +28,8 @@
 	<real>180.0</real>
 	<key>AppZoomMass</key>
 	<real>1.0</real>
+	<key>AppZoomSnapshotUpdates</key>
+	<true/>
 	<key>AppZoomBlur</key>
 	<false/>
 	<key>AppZoomBlurStyle</key>
