@@ -740,7 +740,7 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     if (giveUp) {
         w26_log(@"[%s] gave up waiting for a stable layout", reason);
     } else {
-        w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d home=%d",
+        w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d",
                 reason, now - g_requestedAt, attempt,
                 g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
                 (int)g_pinPresentation);
