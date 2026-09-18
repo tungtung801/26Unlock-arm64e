@@ -138,10 +138,14 @@ double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.29s   */
 /* Unlock straight into a running app (not the home screen). */
 static BOOL   g_cfgAppZoom       = YES;   /* zoom-out + clearing blur        */
 static double g_cfgAppZoomScale  = 1.12;  /* start scale -> 1.0              */
-static double g_cfgAppZoomDur    = 0.24;  /* 0.11 = 6 frames @60Hz = flicker */
+static double g_cfgAppZoomDur    = 0.50;  /* ~0.11 @120Hz, needs ~2-4x @60Hz */
+static double g_cfgAppZoomDamp   = 28.0;  /* >2*sqrt(stiffness*mass) = no bounce back */
+static double g_cfgAppZoomStiff  = 180.0;
+static double g_cfgAppZoomMassV  = 1.0;
+static BOOL   g_cfgAppZoomHide   = YES;   /* hide the lock screen while shooting */
 static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
 static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
-static double g_cfgAppZoomDelay  = 0.20;  /* the lock screen must be GONE    */
+static double g_cfgAppZoomDelay  = 0.30;  /* the lock screen must be GONE    */
 static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
 static BOOL   g_cfgAppZoomBlur   = YES;   /* set NO to drop the blur entirely*/
 
@@ -180,6 +184,14 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomLevel = [v doubleValue];
     v = [d objectForKey:@"AppZoomSnapshotDelay"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomDelay = [v doubleValue];
+    v = [d objectForKey:@"AppZoomDamping"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomDamp   = [v doubleValue];
+    v = [d objectForKey:@"AppZoomStiffness"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomStiff  = [v doubleValue];
+    v = [d objectForKey:@"AppZoomMass"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomMassV  = [v doubleValue];
+    v = [d objectForKey:@"AppZoomHideSheetForSnapshot"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHide   = [v boolValue];
     v = [d objectForKey:@"AppZoomBlur"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomBlur   = [v boolValue];
     v = [d objectForKey:@"AppZoomEarlyBlur"];
@@ -903,11 +915,30 @@ static void w26_appZoomPlay(void) {
         BOOL wasVisible = (g_zoomWindow != nil);
         if (wasVisible) g_zoomWindow.hidden = YES;
 
+        /* Any part of the lock screen still on screen gets baked into the
+         * snapshot, and zooming THAT is the flicker.  Hide it for the one
+         * frame the capture needs, then put it straight back. */
+        NSMutableArray *hidden = [NSMutableArray array];
+        if (g_cfgAppZoomHide && g_coverWindowLevel > 1.0) {
+            for (UIWindow *cw in w26_allWindows()) {
+                if (!cw.hidden && cw.windowLevel >= g_coverWindowLevel - 1.0) {
+                    cw.hidden = YES;
+                    [hidden addObject:cw];
+                }
+            }
+        }
+
         UIView *snap = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
 #pragma clang diagnostic pop
+
+        for (UIWindow *cw in hidden) cw.hidden = NO;
+        if (hidden.count) {
+            w26_log(@"[appzoom] hid %lu lock-screen window(s) for the capture",
+                    (unsigned long)hidden.count);
+        }
 
         if (wasVisible && g_zoomWindow) g_zoomWindow.hidden = NO;
 
@@ -921,27 +952,55 @@ static void w26_appZoomPlay(void) {
         if (!g_zoomWindow) return;
 
         snap.frame = b;
-        snap.transform =
-            CGAffineTransformMakeScale(g_cfgAppZoomScale, g_cfgAppZoomScale);
         [g_zoomWindow insertSubview:snap belowSubview:g_zoomBlurHost];
         g_zoomSnap = snap;
 
-        w26_log(@"[appzoom] play: scale=%.3f dur=%.3f blur=%d",
-                g_cfgAppZoomScale, g_cfgAppZoomDur, (int)g_cfgAppZoomBlur);
+        w26_log(@"[appzoom] play: scale=%.3f dur=%.3f blur=%d "
+                @"spring(damp=%.0f stiff=%.0f mass=%.1f)",
+                g_cfgAppZoomScale, g_cfgAppZoomDur, (int)g_cfgAppZoomBlur,
+                g_cfgAppZoomDamp, g_cfgAppZoomStiff, g_cfgAppZoomMassV);
 
         /* A brand new UIVisualEffectView can come up blank for one frame.
          * Let it render first, otherwise that blank frame is the flicker. */
         dispatch_async(dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:g_cfgAppZoomDur
-                                  delay:0
-                                options:UIViewAnimationOptionCurveEaseOut
+            /* "Bounce in from outside, never spring back": a critically
+             * damped spring - fast start, long smooth settle, no overshoot.
+             * damping > 2*sqrt(stiffness*mass) is what removes the bounce. */
+            CATransform3D from =
+                CATransform3DMakeScale(g_cfgAppZoomScale, g_cfgAppZoomScale, 1.0);
+
+            CASpringAnimation *spring =
+                [CASpringAnimation animationWithKeyPath:@"transform"];
+            spring.fromValue = [NSValue valueWithCATransform3D:from];
+            spring.toValue   = [NSValue valueWithCATransform3D:CATransform3DIdentity];
+            spring.damping   = g_cfgAppZoomDamp;
+            spring.stiffness = g_cfgAppZoomStiff;
+            spring.mass      = g_cfgAppZoomMassV;
+            spring.initialVelocity = 0.0;
+            spring.duration  = g_cfgAppZoomDur;
+            spring.fillMode  = kCAFillModeBackwards;
+            spring.removedOnCompletion = YES;
+            [snap.layer addAnimation:spring forKey:@"wave26.appzoom"];
+
+            /* Commit the model value so removing it cannot pop. */
+            snap.layer.transform = CATransform3DIdentity;
+
+            /* The blur HOLDS while the app is still flying in, then clears
+             * over the last 60% - fading it from frame one is what made it
+             * look like a plain zoom with a flash of frosting on top. */
+            [UIView animateWithDuration:g_cfgAppZoomDur * 0.6
+                                  delay:g_cfgAppZoomDur * 0.4
+                                options:UIViewAnimationOptionCurveEaseIn
                              animations:^{
-                snap.transform = CGAffineTransformIdentity;
                 g_zoomBlurHost.alpha = 0.0;
-            } completion:^(BOOL finished) {
+            } completion:nil];
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                            (int64_t)((g_cfgAppZoomDur + 0.05) * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
                 w26_appZoomTeardown();
                 w26_log(@"[appzoom] done");
-            }];
+            });
         });
     });
 }
