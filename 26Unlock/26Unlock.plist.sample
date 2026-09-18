@@ -16,6 +16,16 @@
 	<true/>
 	<key>ScaleComp</key>
 	<true/>
+	<key>AppZoom</key>
+	<true/>
+	<key>AppZoomScale</key>
+	<real>1.12</real>
+	<key>AppZoomDuration</key>
+	<real>0.11</real>
+	<key>AppZoomBlurStyle</key>
+	<integer>8</integer>
+	<key>AppZoomEarlyBlur</key>
+	<false/>
 	<key>DockTravel</key>
 	<real>380.0</real>
 	<key>DockStiffness</key>

@@ -135,6 +135,27 @@ double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, far too slow    */
 double W26DockDamping   = 28.0;    /* binary 22 -> ~3pt bounce; 28 = clean  */
 double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.29s   */
 
+/* Unlock straight into a running app (not the home screen). */
+static BOOL   g_cfgAppZoom       = YES;   /* zoom-out + clearing blur        */
+static double g_cfgAppZoomScale  = 1.12;  /* start scale -> 1.0              */
+static double g_cfgAppZoomDur    = 0.11;  /* seconds                         */
+static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
+static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
+static double g_cfgAppZoomDelay  = 0.02;  /* let the lock screen clear first */
+static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
+
+static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
+static BOOL     g_appZoomPlayed;
+static UIWindow *g_zoomWindow;
+static UIView   *g_zoomBlurHost;
+static UIView   *g_zoomSnap;
+static double   g_coverWindowLevel;
+
+static void   w26_appZoomTeardown(void);
+static void   w26_appZoomBegin(void);
+static void   w26_appZoomPlay(void);
+static BOOL   w26_unlockGoesToApp(void);
+
 static void w26_loadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
     if (![d isKindOfClass:[NSDictionary class]]) return;
@@ -145,6 +166,20 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitSettle  = [v boolValue];
     v = [d objectForKey:@"ScaleComp"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgScaleComp   = [v boolValue];
+    v = [d objectForKey:@"AppZoom"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoom      = [v boolValue];
+    v = [d objectForKey:@"AppZoomScale"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomScale = [v doubleValue];
+    v = [d objectForKey:@"AppZoomDuration"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomDur   = [v doubleValue];
+    v = [d objectForKey:@"AppZoomBlurStyle"];
+    if ([v respondsToSelector:@selector(intValue)])    g_cfgAppZoomStyle = [v intValue];
+    v = [d objectForKey:@"AppZoomWindowLevel"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomLevel = [v doubleValue];
+    v = [d objectForKey:@"AppZoomSnapshotDelay"];
+    if ([v respondsToSelector:@selector(doubleValue)]) g_cfgAppZoomDelay = [v doubleValue];
+    v = [d objectForKey:@"AppZoomEarlyBlur"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomEarly = [v boolValue];
     v = [d objectForKey:@"DockTravel"];
     if ([v respondsToSelector:@selector(doubleValue)]) W26DockTravel    = [v doubleValue];
     v = [d objectForKey:@"DockStiffness"];
@@ -711,6 +746,9 @@ static void w26_armCycle(const char *why) {
     g_pinPresentation  = NO;
     g_stableSamples    = 0;
     g_prevCenters      = nil;
+    g_appZoomFlow      = NO;
+    g_appZoomPlayed    = NO;
+    w26_appZoomTeardown();
     w26_log(@"cycle armed (%s) id=%llu", why, (unsigned long long)g_cycleID);
 }
 
@@ -720,6 +758,173 @@ static void w26_retry(int attempt, uint64_t cycle, const char *reason) {
                    dispatch_get_main_queue(), ^{
         w26_waitAndPlay(attempt + 1, cycle, reason);
     });
+}
+
+/* ------------------------------------------------------------------ */
+#pragma mark - unlock into a running app: quick zoom-out + clearing blur
+/* ------------------------------------------------------------------ */
+
+/* SpringBoard does not own the app's own layers, so the zoom is played on a
+ * snapshot of the screen instead - the running app sits underneath and the
+ * snapshot lands exactly on top of it at scale 1.0, so the handover is
+ * invisible.  The blur covers the one moment where they are swapped. */
+
+static void w26_appZoomTeardown(void) {
+    if (!g_zoomWindow) return;
+    g_zoomWindow.hidden = YES;
+    [g_zoomSnap removeFromSuperview];
+    [g_zoomBlurHost removeFromSuperview];
+    g_zoomSnap = nil;
+    g_zoomBlurHost = nil;
+    g_zoomWindow = nil;
+}
+
+static void w26_appZoomBegin(void) {
+    if (g_zoomWindow) return;
+
+    CGRect b = [UIScreen mainScreen].bounds;
+    if (CGRectIsEmpty(b)) return;
+
+    double level = g_cfgAppZoomLevel;
+    if (level <= 0.0) {
+        level = (g_coverWindowLevel > 1.0) ? (g_coverWindowLevel - 1.0) : 100.0;
+    }
+
+    UIWindow *w = nil;
+    UIWindowScene *scene = nil;
+    for (UIScene *sc in [[UIApplication sharedApplication] connectedScenes]) {
+        if ([sc isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)sc; break; }
+    }
+    if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
+        w = [[UIWindow alloc] initWithWindowScene:scene];
+    }
+    if (!w) w = [[UIWindow alloc] initWithFrame:b];
+
+    w.frame = b;
+    w.windowLevel = level;
+    w.backgroundColor = [UIColor clearColor];
+    w.userInteractionEnabled = NO;
+    w.hidden = NO;
+    g_zoomWindow = w;
+
+    /* The blur sits in its own host view: animating a UIVisualEffectView's
+     * own alpha is unreliable, animating its container is not. */
+    UIView *host = [[UIView alloc] initWithFrame:b];
+    host.backgroundColor = [UIColor clearColor];
+    UIBlurEffect *fx =
+        [UIBlurEffect effectWithStyle:(UIBlurEffectStyle)g_cfgAppZoomStyle];
+    UIVisualEffectView *fxv = [[UIVisualEffectView alloc] initWithEffect:fx];
+    fxv.frame = b;
+    fxv.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [host addSubview:fxv];
+    [w addSubview:host];
+    g_zoomBlurHost = host;
+
+    w26_log(@"[appzoom] blur up (level=%.0f style=%d)", level, g_cfgAppZoomStyle);
+}
+
+static void w26_appZoomPlay(void) {
+    if (!g_appZoomFlow || g_appZoomPlayed) return;
+    g_appZoomPlayed = YES;
+
+    CGRect b = [UIScreen mainScreen].bounds;
+    if (CGRectIsEmpty(b)) { w26_appZoomTeardown(); return; }
+
+    /* Give the leaving lock screen one frame, then capture the app.  The
+     * blur must not be on screen while doing so or it gets baked in. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)(g_cfgAppZoomDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!g_appZoomFlow) return;
+
+        BOOL wasVisible = (g_zoomWindow != nil);
+        if (wasVisible) g_zoomWindow.hidden = YES;
+
+        UIView *snap = nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
+#pragma clang diagnostic pop
+
+        if (wasVisible && g_zoomWindow) g_zoomWindow.hidden = NO;
+
+        if (!snap) {
+            w26_log(@"[appzoom] snapshot failed - zoom skipped");
+            w26_appZoomTeardown();
+            return;
+        }
+
+        if (!g_zoomWindow) w26_appZoomBegin();
+        if (!g_zoomWindow) return;
+
+        snap.frame = b;
+        snap.transform =
+            CGAffineTransformMakeScale(g_cfgAppZoomScale, g_cfgAppZoomScale);
+        [g_zoomWindow insertSubview:snap belowSubview:g_zoomBlurHost];
+        g_zoomSnap = snap;
+
+        w26_log(@"[appzoom] play: scale=%.3f dur=%.3f",
+                g_cfgAppZoomScale, g_cfgAppZoomDur);
+
+        [UIView animateWithDuration:g_cfgAppZoomDur
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            snap.transform = CGAffineTransformIdentity;
+            g_zoomBlurHost.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            w26_appZoomTeardown();
+            w26_log(@"[appzoom] done");
+        }];
+    });
+}
+
+/* Which bundle is in the foreground?  nil / SpringBoard = home screen.
+ * The entry points differ between iOS versions and none of them is in a
+ * public header, so all three are tried and the winner is logged. */
+static NSString *w26_frontmostBundleID(void) {
+    id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    int method = 0;
+    id front = nil;
+
+    id ac = [NSClassFromString(@"SBApplicationController") sharedInstance];
+    if (ac && [ac respondsToSelector:@selector(frontmostApplication)]) {
+        front = msg(ac, @selector(frontmostApplication));
+        if (front) method = 1;
+    }
+    if (!front) {
+        id ws = [NSClassFromString(@"SBMainWorkspace") sharedInstance];
+        if (ws && [ws respondsToSelector:@selector(frontmostApplication)]) {
+            front = msg(ws, @selector(frontmostApplication));
+            if (front) method = 2;
+        }
+    }
+    if (!front) {
+        UIApplication *app = [UIApplication sharedApplication];
+        SEL sel = @selector(_accessibilityFrontMostApplication);
+        if (app && [app respondsToSelector:sel]) {
+            front = msg(app, sel);
+            if (front) method = 3;
+        }
+    }
+
+    NSString *bid = nil;
+    if ([front respondsToSelector:@selector(bundleIdentifier)]) {
+        bid = msg(front, @selector(bundleIdentifier));
+    }
+    if (!bid && front) bid = NSStringFromClass([front class]);
+
+    w26_log(@"probe frontmost: method=%d id=%@", method, bid ? bid : @"(none)");
+    return bid;
+}
+
+static BOOL w26_unlockGoesToApp(void) {
+    if (!g_cfgAppZoom) return NO;
+    NSString *bid = w26_frontmostBundleID();
+    if (bid.length == 0) return NO;
+    if ([bid isEqualToString:@"com.apple.springboard"]) return NO;
+    return YES;
 }
 
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
@@ -796,6 +1001,21 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
                 reason, now - g_requestedAt, attempt,
                 g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
                 (int)g_pinPresentation);
+    }
+
+    /* Unlocking straight into a running app: there is no icon grid to wave,
+     * so play the short zoom-out with the blur clearing as it lands. */
+    if (g_appZoomFlow) {
+        g_fireRequested = NO;
+        if (!g_coverSheetGone && giveUp) {
+            w26_log(@"[appzoom] cancelled - the lock screen never left");
+            w26_appZoomTeardown();
+            return;
+        }
+        g_fireDone = YES;
+        w26_log(@"[appzoom] into an app - icon wave skipped");
+        w26_appZoomPlay();
+        return;
     }
 
     /* Pin SpringBoard's reveal so the icons cannot be pulled back into the
@@ -1054,6 +1274,10 @@ static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
         orig(self, _cmd, animated);
     }
     g_onLockScreen = YES;
+    {
+        UIWindow *cw = [(UIViewController *)self view].window;
+        if (cw && cw.windowLevel > 1.0) g_coverWindowLevel = cw.windowLevel;
+    }
         w26_armCycle("cover appeared");
 }
 
@@ -1162,7 +1386,12 @@ static void w26_registerLockStateNotifications(void) {
 
         /* Works for both flows: passcode (no pan) and swipe (velocity already
          * captured).  This is the only place the unlock is confirmed. */
-        w26_log(@"unlock confirmed (pan=%d)", (int)g_panFired);
+        g_appZoomFlow = w26_unlockGoesToApp();
+        if (g_appZoomFlow && g_cfgAppZoomEarly) {
+            w26_appZoomBegin();      /* blur while the lock screen leaves */
+        }
+        w26_log(@"unlock confirmed (pan=%d) appZoom=%d",
+                (int)g_panFired, (int)g_appZoomFlow);
         w26_requestWaveCheck("lockstate");
     });
 }
