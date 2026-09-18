@@ -173,7 +173,6 @@ static NSMutableArray *g_prevCenters;
 static NSMapTable *g_homeMap;           /* UIView * -> home centre (window)   */
 
 static void w26_captureHomeLayout(void);
-
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason);
 static void w26_retry(int attempt, uint64_t cycle, const char *reason);
 static void w26_armCycle(const char *why);
@@ -375,8 +374,9 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
 
         /* If this icon's true home is known (recorded while the phone was
          * locked), make the wave land THERE instead of at the condensed
-         * position SpringBoard is currently holding it at.  This is what
-         * removes the clump without having to wait for the reveal. */
+         * position SpringBoard is currently holding it at. This is what
+         * removes the "clump together then snap out" look on rows 3/4
+         * without having to wait for SpringBoard's own reveal to finish. */
         NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
         if (homeVal && view.superview) {
             CGPoint homeWindow = [homeVal CGPointValue];
@@ -625,16 +625,17 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     }
 
     /* The notification-centre flow is not an unlock: the grid is already at
-     * rest, so there is nothing to wait for - it must always play. */
+     * rest, so there is nothing to wait for here - only a real unlock needs
+     * the readiness checks below. */
     BOOL strict = g_unlockConfirmed;
 
     if (strict) {
         NSArray *icons = w26_collectIconViews();
 
         /* Waiting for the icons to come to rest guarantees a clean grid but
-         * costs the length of SpringBoard's reveal, and by then the stock
-         * animation has already been seen.  The home override makes the wave
-         * land correctly even when it starts early, so waiting is off by
+         * costs the length of SpringBoard's reveal, and the home override
+         * registered in w26_registerHome() already makes the wave land
+         * correctly even when it starts early - so this wait is off by
          * default and can be switched back on with WaitForStable. */
         if (g_cfgWaitStable && !g_pinPresentation) {
             if (!w26_iconLayoutStable(icons) && !giveUp) {
@@ -734,7 +735,7 @@ static BOOL w26_iconsHaveValidFrames(NSArray *icons) {
 }
 
 /* When the device locks, the home screen is at rest and the icon grid is at
- * its true home positions.  Remembering that layout gives an exact reference
+ * its true home positions. Remembering that layout gives an exact reference
  * for "the icons are home", whatever mechanism a given iOS version uses to
  * condense them during the unlock. */
 static void w26_captureHomeLayout(void) {
