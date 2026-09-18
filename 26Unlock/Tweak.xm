@@ -137,17 +137,17 @@ double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.29s   */
 
 /* Unlock straight into a running app (not the home screen). */
 static BOOL   g_cfgAppZoom       = YES;   /* zoom-out + clearing blur        */
-static double g_cfgAppZoomScale  = 1.12;  /* start scale -> 1.0              */
-static double g_cfgAppZoomDur    = 0.50;  /* ~0.11 @120Hz, needs ~2-4x @60Hz */
+static double g_cfgAppZoomScale  = 1.20;  /* start scale -> 1.0              */
+static double g_cfgAppZoomDur    = 0.40;  /* ~0.11 @120Hz, needs ~2-4x @60Hz */
 static double g_cfgAppZoomDamp   = 28.0;  /* >2*sqrt(stiffness*mass) = no bounce back */
 static double g_cfgAppZoomStiff  = 180.0;
 static double g_cfgAppZoomMassV  = 1.0;
 static BOOL   g_cfgAppZoomHide   = YES;   /* hide the lock screen while shooting */
 static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
 static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
-static double g_cfgAppZoomDelay  = 0.30;  /* the lock screen must be GONE    */
+static double g_cfgAppZoomDelay  = 0.05;  /* the sheet is hidden, not awaited */
 static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
-static BOOL   g_cfgAppZoomBlur   = YES;   /* set NO to drop the blur entirely*/
+static BOOL   g_cfgAppZoomBlur   = NO;    /* OFF for now - testing the flicker*/
 
 static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
 static BOOL     g_appZoomPlayed;
@@ -960,9 +960,7 @@ static void w26_appZoomPlay(void) {
                 g_cfgAppZoomScale, g_cfgAppZoomDur, (int)g_cfgAppZoomBlur,
                 g_cfgAppZoomDamp, g_cfgAppZoomStiff, g_cfgAppZoomMassV);
 
-        /* A brand new UIVisualEffectView can come up blank for one frame.
-         * Let it render first, otherwise that blank frame is the flicker. */
-        dispatch_async(dispatch_get_main_queue(), ^{
+        void (^w26_runZoom)(void) = ^{
             /* "Bounce in from outside, never spring back": a critically
              * damped spring - fast start, long smooth settle, no overshoot.
              * damping > 2*sqrt(stiffness*mass) is what removes the bounce. */
@@ -1001,7 +999,16 @@ static void w26_appZoomPlay(void) {
                 w26_appZoomTeardown();
                 w26_log(@"[appzoom] done");
             });
-        });
+        };
+
+        if (g_cfgAppZoomBlur) {
+            /* A brand new UIVisualEffectView can come up blank for one
+             * frame; letting it render first is what avoids that flash.
+             * With the blur off there is nothing to warm up - start now. */
+            dispatch_async(dispatch_get_main_queue(), w26_runZoom);
+        } else {
+            w26_runZoom();
+        }
     });
 }
 
