@@ -21,7 +21,9 @@
 	<key>AppZoomScale</key>
 	<real>1.12</real>
 	<key>AppZoomDuration</key>
-	<real>0.11</real>
+	<real>0.24</real>
+	<key>AppZoomBlur</key>
+	<true/>
 	<key>AppZoomBlurStyle</key>
 	<integer>8</integer>
 	<key>AppZoomEarlyBlur</key>

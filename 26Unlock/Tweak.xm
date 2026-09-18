@@ -141,7 +141,7 @@ static double g_cfgAppZoomScale  = 1.12;  /* start scale -> 1.0              */
 static double g_cfgAppZoomDur    = 0.24;  /* 0.11 = 6 frames @60Hz = flicker */
 static int    g_cfgAppZoomStyle  = 8;     /* UIBlurEffectStyleSystemMaterial */
 static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
-static double g_cfgAppZoomDelay  = 0.06;  /* let the lock screen clear first */
+static double g_cfgAppZoomDelay  = 0.20;  /* the lock screen must be GONE    */
 static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
 static BOOL   g_cfgAppZoomBlur   = YES;   /* set NO to drop the blur entirely*/
 
@@ -153,6 +153,7 @@ static UIView   *g_zoomSnap;
 static double   g_coverWindowLevel;
 
 static void   w26_appZoomTeardown(void);
+static void   w26_probeAppHost(void);
 static void   w26_appZoomBegin(void);
 static void   w26_appZoomPlay(void);
 static BOOL   w26_unlockGoesToApp(void);
@@ -772,6 +773,43 @@ static void w26_retry(int attempt, uint64_t cycle, const char *reason) {
  * snapshot lands exactly on top of it at scale 1.0, so the handover is
  * invisible.  The blur covers the one moment where they are swapped. */
 
+/* Log-only.  Zooming a snapshot freezes the app for the length of the
+ * animation; transforming the app's real host layer would not.  These lines
+ * tell us what is actually reachable from inside SpringBoard. */
+static void w26_probeAppHost(void) {
+    id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+
+    for (UIWindow *w in w26_allWindows()) {
+        w26_log(@"probe win: %@ level=%.0f hidden=%d alpha=%.2f",
+                NSStringFromClass([w class]), w.windowLevel,
+                (int)w.hidden, w.alpha);
+    }
+
+    id mgr = [NSClassFromString(@"FBSceneManager") sharedInstance];
+    if (!mgr) mgr = [NSClassFromString(@"SBSceneManager") sharedInstance];
+    if (!mgr) {
+        w26_log(@"probe scene: no scene manager");
+        return;
+    }
+
+    NSArray *scenes = nil;
+    if ([mgr respondsToSelector:@selector(allScenes)]) {
+        scenes = msg(mgr, @selector(allScenes));
+    }
+    w26_log(@"probe scene manager: %@ scenes=%lu",
+            NSStringFromClass([mgr class]), (unsigned long)scenes.count);
+
+    for (id sc in scenes) {
+        NSString *ident = [sc respondsToSelector:@selector(identifier)]
+                        ? msg(sc, @selector(identifier)) : nil;
+        id host = [sc respondsToSelector:@selector(contextHostManager)]
+                ? msg(sc, @selector(contextHostManager)) : nil;
+        w26_log(@"probe scene: %@ id=%@ host=%@",
+                NSStringFromClass([sc class]), ident,
+                host ? NSStringFromClass([host class]) : @"(none)");
+    }
+}
+
 static void w26_appZoomTeardown(void) {
     if (!g_zoomWindow) return;
     g_zoomWindow.hidden = YES;
@@ -846,6 +884,21 @@ static void w26_appZoomPlay(void) {
                                 (int64_t)(g_cfgAppZoomDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!g_appZoomFlow) return;
+
+        /* Is the lock screen really gone?  If it is still around the snapshot
+         * is of the LOCK SCREEN, and zooming that is the flicker. */
+        {
+            BOOL sheetStillUp = NO;
+            for (UIWindow *cw in w26_allWindows()) {
+                if (cw.hidden || cw.alpha < 0.01) continue;
+                if (g_coverWindowLevel > 1.0 &&
+                    cw.windowLevel >= g_coverWindowLevel - 1.0) {
+                    sheetStillUp = YES;
+                }
+            }
+            w26_log(@"[appzoom] snapshot: lockScreenStillUp=%d", (int)sheetStillUp);
+            w26_probeAppHost();
+        }
 
         BOOL wasVisible = (g_zoomWindow != nil);
         if (wasVisible) g_zoomWindow.hidden = YES;
