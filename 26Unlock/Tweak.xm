@@ -96,7 +96,7 @@ static CFTimeInterval g_lastFireTime;
 static CFTimeInterval g_lockScreenDismissed;
 static CFTimeInterval g_unlockedAt;
 
-static const CFTimeInterval kW26Debounce = 0.15;
+static const CFTimeInterval kW26Debounce = 0.08;
 static const double kW26DefaultVelocity  = -1250.0;
 /* If the pan already played a wave but the unlock only finished much later
  * (passcode typing takes seconds), play a fresh one at the cover-sheet
@@ -330,7 +330,7 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
     [g_engine setDockView:dock];
 
     NSMutableArray *ordered = [NSMutableArray array];
-    NSMutableArray *centres = [NSMutableArray array];
+    NSMutableArray *centres = [NSMutableArray array];  /* window-space, TRUE home when known */
 
     double minX = INFINITY, maxX = -INFINITY;
     double minY = INFINITY, maxY = -INFINITY;
@@ -343,16 +343,24 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
         CGRect frame = [view convertRect:view.bounds toView:nil];
         if (CGRectIsNull(frame) || CGRectIsEmpty(frame)) continue;
 
-        double midX = CGRectGetMidX(frame);
-        double midY = CGRectGetMidY(frame);
+        /* Use the recorded at-rest position for binning whenever we have
+         * one. A condensed/transient frame (SpringBoard mid-reveal) would
+         * otherwise squeeze every icon's centre into a tiny bounding box,
+         * so they all land in the same handful of grid cells - same wave
+         * number, same delay, same huge scale-up factor - which is what
+         * made the whole grid look like one shrinking blob instead of a
+         * staggered, per-position wave. */
+        NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
+        CGPoint centre = homeVal ? [homeVal CGPointValue]
+                                  : CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
 
         [ordered addObject:view];
-        [centres addObject:[NSValue valueWithCGPoint:CGPointMake(midX, midY)]];
+        [centres addObject:[NSValue valueWithCGPoint:centre]];
 
-        if (midX < minX) minX = midX;
-        if (midX > maxX) maxX = midX;
-        if (midY < minY) minY = midY;
-        if (midY > maxY) maxY = midY;
+        if (centre.x < minX) minX = centre.x;
+        if (centre.x > maxX) maxX = centre.x;
+        if (centre.y < minY) minY = centre.y;
+        if (centre.y > maxY) maxY = centre.y;
     }
 
     if (ordered.count == 0) return;
@@ -372,11 +380,9 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
 
         [g_engine registerIcon:view col:col row:row];
 
-        /* If this icon's true home is known (recorded while the phone was
-         * locked), make the wave land THERE instead of at the condensed
-         * position SpringBoard is currently holding it at. This is what
-         * removes the "clump together then snap out" look on rows 3/4
-         * without having to wait for SpringBoard's own reveal to finish. */
+        /* Land the icon at its true home too (same reference as above), so
+         * the final position is correct even if SpringBoard's own reveal
+         * has not caught up yet. */
         NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
         if (homeVal && view.superview) {
             CGPoint homeWindow = [homeVal CGPointValue];
@@ -856,6 +862,16 @@ static void w26_presProgressReached(double progress) {
         /* Readiness signal only - never an independent unlock trigger. */
         w26_requestWaveCheck("progress");
     } else {
+        if (g_presComplete) {
+            /* Progress just left 1.0: SpringBoard is condensing the grid
+             * again for a brand-new pull-down (or the same one bouncing).
+             * That is unambiguous proof this is a fresh gesture, so let the
+             * next completion fire for sure - a time-based debounce alone
+             * can't tell "same event settling" from "user was just fast",
+             * which is what dropped the wave on a quick down+up. */
+            g_fireDone = NO;
+            g_fireRequested = NO;
+        }
         g_presComplete = NO;
     }
 }

@@ -322,6 +322,16 @@ static const CGFloat kSpringMass = 1.5;
     scale.removedOnCompletion = YES;
 
     [layer addAnimation:scale forKey:kKeyScale];
+
+    /* CAAnimation only drives the presentation layer. If the MODEL layer is
+     * never updated to match, removedOnCompletion snaps the icon back to
+     * whatever position/scale it had before the wave started - a small,
+     * visible "pop" right as the spring finishes (the "icon drifts then
+     * locks into place" bug). Committing the final values now costs nothing
+     * visually (fillMode:Backwards keeps showing fromValue until beginTime)
+     * and makes the end-of-animation state exactly match what is on screen. */
+    layer.position = original;
+    layer.transform = CATransform3DIdentity;
 }
 
 - (void)animateDock:(double)pullVelocity {
@@ -363,6 +373,10 @@ static const CGFloat kSpringMass = 1.5;
     animation.removedOnCompletion = YES;
 
     [layer addAnimation:animation forKey:kKeyDock];
+
+    /* See animateIcon: commit the model value so removal doesn't pop the
+     * dock back to its pre-wave position. */
+    layer.position = original;
 }
 
 - (void)reset {
