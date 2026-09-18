@@ -120,7 +120,7 @@ static BOOL   g_cfgPinPres     = YES;   /* suppress SpringBoard's own reveal  */
 static BOOL   g_cfgWaitStable  = NO;    /* wait for the grid to stop moving   */
 static BOOL   g_cfgWaitSettle  = NO;    /* wait until the grid scale is 1.0   */
 static BOOL   g_cfgWaitCover   = NO;   /* wait until the lock screen is gone */
-static BOOL   g_cfgWaitGrid    = YES;   /* wait until the icon grid is at home*/
+static BOOL   g_cfgWaitGrid    = NO;    /* wait until the icon grid is at home*/
 static double g_cfgGridMin     = 0.50;  /* min bbox width / screen width      */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
@@ -170,9 +170,7 @@ static BOOL     g_coverSheetGone;   /* SBCoverSheetViewController dismissed  */
 static BOOL     g_presComplete;     /* no home presentation pending          */
 static int      g_stableSamples;    /* consecutive identical layout samples  */
 static NSMutableArray *g_prevCenters;
-static NSMapTable *g_homeMap;           /* UIView * -> home centre (window)   */
 
-static void w26_captureHomeLayout(void);
 static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason);
 static void w26_retry(int attempt, uint64_t cycle, const char *reason);
 static void w26_armCycle(const char *why);
@@ -308,16 +306,100 @@ static BOOL w26_isInDock(UIView *view, UIView *dock) {
     return NO;
 }
 
-static void w26_stripAnimations(UIView *view) {
+/* Only transforms may be touched.  removeAllAnimations() up the whole chain
+ * also killed SpringBoard's own cross-fades (lock screen clock, torch/camera
+ * buttons, wallpaper) - that is why they vanished early, and the layout then
+ * snapped back when the guard stopped and they resumed. */
+static void w26_stripIcon(UIView *view) {
     if (!view) return;
-    [view.layer removeAllAnimations];
+    CALayer *l = view.layer;
+    if (!l) return;
+
+    for (NSString *k in [[l animationKeys] copy]) {
+        if ([k hasPrefix:@"wave26."]) continue;              /* our own    */
+        CAAnimation *anim = [l animationForKey:k];
+        NSString *path = [anim isKindOfClass:[CAPropertyAnimation class]]
+                       ? [(CAPropertyAnimation *)anim keyPath] : nil;
+        /* opacity stays - SpringBoard may still fade the icons in. */
+        if ([path isEqualToString:@"position"] ||
+            [path isEqualToString:@"transform"]) {
+            [l removeAnimationForKey:k];
+        }
+    }
 }
 
-static void w26_stripAncestors(UIView *view) {
-    UIView *current = view;
-    while (current) {
-        [current.layer removeAllAnimations];
-        current = current.superview;
+/* SpringBoard's unlock reveal is a transform on a container ABOVE the icons.
+ * Cancelling it, and forcing any leftover transform back to identity, makes
+ * the grid render 1:1 - so the wave neither starts squeezed (the clump) nor
+ * jumps when the reveal finishes (the hard snap). */
+static void w26_neutralizeReveal(UIView *view, BOOL verbose) {
+    UIView *a = view;
+    for (int i = 0; a && i < 8; i++) {
+        if ([a isKindOfClass:[UIWindow class]]) break;
+        CALayer *l = a.layer;
+        if (!l) break;
+
+        for (NSString *k in [[l animationKeys] copy]) {
+            if ([k hasPrefix:@"wave26."]) continue;
+            CAAnimation *anim = [l animationForKey:k];
+            NSString *path = [anim isKindOfClass:[CAPropertyAnimation class]]
+                           ? [(CAPropertyAnimation *)anim keyPath] : nil;
+            /* position/bounds on a container are the page scroll offset and
+             * opacity is SpringBoard's cross-fade - leave both alone. */
+            if ([path isEqualToString:@"transform"] ||
+                [path isEqualToString:@"sublayerTransform"]) {
+                [l removeAnimationForKey:k];
+            }
+        }
+
+        if (!CATransform3DIsIdentity(l.transform)) {
+            if (verbose) {
+                w26_log(@"  reveal: forced %@ transform -> identity",
+                        NSStringFromClass([a class]));
+            }
+            l.transform = CATransform3DIdentity;
+        }
+        if (!CATransform3DIsIdentity(l.sublayerTransform)) {
+            l.sublayerTransform = CATransform3DIdentity;
+        }
+
+        a = a.superview;
+    }
+}
+
+/* One-shot dump so the next log shows exactly which layer carries the reveal
+ * and what SpringBoard animates on it. */
+static void w26_probe(NSArray *icons) {
+    if (icons.count == 0) return;
+
+    for (NSUInteger i = 0; i < icons.count && i < 3; i++) {
+        UIView *v = icons[i];
+        CALayer *l = v.layer;
+        CGPoint model = l ? l.position : CGPointZero;
+        CGPoint pres  = l ? [[l presentationLayer] position] : CGPointZero;
+        CGRect  wf    = [v convertRect:v.bounds toView:nil];
+        w26_log(@"probe icon%lu: model=(%.1f,%.1f) pres=(%.1f,%.1f) "
+                @"window=(%.1f,%.1f) ancestorScale=%.3f",
+                (unsigned long)i, model.x, model.y, pres.x, pres.y,
+                CGRectGetMidX(wf), CGRectGetMidY(wf), w26_effectiveScale(v));
+    }
+
+    UIView *a = [icons[0] superview];
+    for (int i = 0; a && i < 8; i++) {
+        CALayer *l = a.layer;
+        NSMutableArray *paths = [NSMutableArray array];
+        for (NSString *k in [l animationKeys]) {
+            CAAnimation *anim = [l animationForKey:k];
+            NSString *pp = [anim isKindOfClass:[CAPropertyAnimation class]]
+                         ? [(CAPropertyAnimation *)anim keyPath] : @"(basic)";
+            [paths addObject:pp ? pp : @"(nil)"];
+        }
+        w26_log(@"probe anc%d: %@ | transform=%@ | anims=%@", i,
+                NSStringFromClass([a class]),
+                CATransform3DIsIdentity(l.transform) ? @"identity" : @"SCALED",
+                paths.count ? [paths componentsJoinedByString:@","] : @"none");
+        if ([a isKindOfClass:[UIWindow class]]) break;
+        a = a.superview;
     }
 }
 
@@ -350,9 +432,7 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
          * number, same delay, same huge scale-up factor - which is what
          * made the whole grid look like one shrinking blob instead of a
          * staggered, per-position wave. */
-        NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
-        CGPoint centre = homeVal ? [homeVal CGPointValue]
-                                  : CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
+        CGPoint centre = view.center;
 
         [ordered addObject:view];
         [centres addObject:[NSValue valueWithCGPoint:centre]];
@@ -379,17 +459,6 @@ static void w26_registerHome(NSArray *icons, UIView *dock) {
         if (row < 0) row = 0; else if (row > 5) row = 5;
 
         [g_engine registerIcon:view col:col row:row];
-
-        /* Land the icon at its true home too (same reference as above), so
-         * the final position is correct even if SpringBoard's own reveal
-         * has not caught up yet. */
-        NSValue *homeVal = g_homeMap ? [g_homeMap objectForKey:view] : nil;
-        if (homeVal && view.superview) {
-            CGPoint homeWindow = [homeVal CGPointValue];
-            CGPoint homeLocal  = [view.superview convertPoint:homeWindow
-                                                     fromView:nil];
-            [g_engine setHomeOverride:homeLocal forView:view];
-        }
     }
 }
 
@@ -463,11 +532,13 @@ static void w26_fire(double velocity, int attempt) {
     UIView *dock = w26_findDockView();
     w26_registerHome(icons, dock);
 
-    for (UIView *view in icons) w26_stripAnimations(view);
-    if (dock) w26_stripAnimations(dock);
+    w26_probe(icons);
 
-    for (UIView *view in icons) w26_stripAncestors(view);
-    if (dock) w26_stripAncestors(dock);
+    for (UIView *view in icons) w26_stripIcon(view);
+    if (dock) w26_stripIcon(dock);
+
+    for (UIView *view in icons) w26_neutralizeReveal(view, YES);
+    if (dock) w26_neutralizeReveal(dock, YES);
 
     [g_engine playWithPullVelocity:velocity];
 
@@ -545,17 +616,7 @@ static double w26_effectiveScale(UIView *view) {
 
 /* Remove every animation that is NOT ours (ours are keyed "wave26.*"). */
 static void w26_stripForeign(UIView *view) {
-    UIView *a = view;
-    for (int i = 0; a && i < 8; i++) {
-        CALayer *l = a.layer;
-        NSArray *keys = [l animationKeys];
-        if (keys.count) {
-            for (NSString *k in [keys copy]) {
-                if (![k hasPrefix:@"wave26."]) [l removeAnimationForKey:k];
-            }
-        }
-        a = a.superview;
-    }
+    w26_neutralizeReveal(view, NO);   /* transforms only - never the fades */
 }
 
 static void w26_guardTick(NSArray *icons, int ticksLeft) {
@@ -658,8 +719,7 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
         }
         /* No recorded home layout at all (first unlock right after a
          * respring): fall back to the width heuristic. */
-        if (!g_homeMap && g_cfgWaitGrid &&
-            !w26_iconsHaveValidFrames(icons) && !giveUp) {
+        if (g_cfgWaitGrid && !w26_iconsHaveValidFrames(icons) && !giveUp) {
             if (attempt == 0) w26_log(@"[%s] icon frames not valid yet", reason);
             w26_retry(attempt, cycle, reason);
             return;
@@ -683,7 +743,7 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
         w26_log(@"[%s] ready after %.2f s (%d samples) vel=%.0f pin=%d home=%d",
                 reason, now - g_requestedAt, attempt,
                 g_haveVel ? g_lastVel.y : kW26DefaultVelocity,
-                (int)g_pinPresentation, (int)(g_homeMap != nil));
+                (int)g_pinPresentation);
     }
 
     /* Pin SpringBoard's reveal so the icons cannot be pulled back into the
@@ -747,26 +807,6 @@ static BOOL w26_iconsHaveValidFrames(NSArray *icons) {
 
     double span = maxX - minX;
     return (bounds.size.width > 0) && (span >= g_cfgGridMin * bounds.size.width);
-}
-
-/* When the device locks, the home screen is at rest and the icon grid is at
- * its true home positions. Remembering that layout gives an exact reference
- * for "the icons are home", whatever mechanism a given iOS version uses to
- * condense them during the unlock. */
-static void w26_captureHomeLayout(void) {
-    NSArray *icons = w26_collectIconViews();
-    if (icons.count < 2) return;
-
-    /* Keyed by the view itself and weak, so dead icons simply disappear and
-     * the order of collection can never matter. */
-    NSMapTable *m = [NSMapTable weakToStrongObjectsMapTable];
-    for (UIView *v in icons) {
-        CGRect f = [v convertRect:v.bounds toView:nil];
-        [m setObject:[NSValue valueWithCGPoint:
-            CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f))] forKey:v];
-    }
-    g_homeMap = m;
-    w26_log(@"home layout captured (%lu icons)", (unsigned long)icons.count);
 }
 
 static BOOL w26_iconLayoutStable(NSArray *icons) {
@@ -962,8 +1002,7 @@ static void w26_viewWillAppear(id self, SEL _cmd, BOOL animated) {
         orig(self, _cmd, animated);
     }
     g_onLockScreen = YES;
-    w26_captureHomeLayout();           /* home screen is at rest now */
-    w26_armCycle("cover appeared");
+        w26_armCycle("cover appeared");
 }
 
 static void w26_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
@@ -1060,8 +1099,7 @@ static void w26_registerLockStateNotifications(void) {
 
         if (state == 1) {           /* locked again - re-arm the cycle */
             g_onLockScreen = YES;
-            w26_captureHomeLayout();   /* home screen is at rest now */
-            w26_armCycle("locked");
+                        w26_armCycle("locked");
             return;
         }
 
@@ -1090,13 +1128,6 @@ static void w26_init(void) {
     /* Nothing is being presented until SpringBoard says otherwise, so the
      * very first unlock after a respring must start from a clean cycle. */
     w26_armCycle("boot");
-
-    /* Give SpringBoard a moment to finish its own respring layout, then
-     * record the home positions. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        w26_captureHomeLayout();
-    });
 
     w26_log(@"==== 26Unlock loaded (no substrate) ====");
     w26_log(@"iOS %@ | pan=%@ | edge=%@ | icon=%@ | dock=%@ | coverSheetClass=%@",
