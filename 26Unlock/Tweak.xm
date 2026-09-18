@@ -619,7 +619,14 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
     BOOL giveUp = (attempt >= kW26MaxAttempts);
 
-    /* 1. the home screen must actually be on its way in */
+    /* 0. the lock screen must have ACTUALLY, VISUALLY gone - not merely
+     *    reported unlocked at the data layer. See rationale above. */
+    if (g_haveCoverClass && !g_coverSheetGone && !giveUp) {
+        w26_retry(attempt, cycle, reason);
+        return;
+    }
+    /* 1. the home screen must actually be on its way in (fallback for iOS
+     *    versions where the cover sheet class could not be found at all) */
     if (!g_unlockConfirmed && !g_coverSheetGone && !giveUp) {
         w26_retry(attempt, cycle, reason);
         return;
@@ -679,6 +686,19 @@ static void w26_waitAndPlay(int attempt, uint64_t cycle, const char *reason) {
                 (int)g_pinPresentation, (int)(g_homeMap != nil));
     }
 
+    /* Pin SpringBoard's reveal so the icons cannot be pulled back into the
+     * condensed pre-unlock layout while the wave plays. Done here, not at
+     * request time, so it can never force-complete the layout while the
+     * lock screen is still visually covering the screen. */
+    if (g_cfgPinPres) {
+        g_pinPresentation = YES;
+        w26_forceHomePresentation();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            g_pinPresentation = NO;
+        });
+    }
+
     g_fireRequested = NO;
     w26_fire(g_haveVel ? g_lastVel.y : kW26DefaultVelocity, 0);
 }
@@ -700,17 +720,6 @@ static void w26_requestWaveCheck(const char *reason) {
     g_fireRequested = YES;
     g_requestedAt   = CFAbsoluteTimeGetCurrent();
     w26_loadSettings();
-
-    /* Pin SpringBoard's reveal so the icons cannot be pulled back into the
-     * condensed pre-unlock layout while the wave plays. */
-    if ((g_unlockConfirmed || !g_haveCoverClass) && g_cfgPinPres) {
-        g_pinPresentation = YES;
-        w26_forceHomePresentation();
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        g_pinPresentation = NO;
-    });
 
     w26_log(@"wave requested (%s) confirmed=%d coverGone=%d presComplete=%d",
             reason, (int)g_unlockConfirmed, (int)g_coverSheetGone,
