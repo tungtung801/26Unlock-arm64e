@@ -149,18 +149,36 @@ static double g_cfgAppZoomLevel  = 0.0;   /* 0 = auto: just under the sheet  */
 static double g_cfgAppZoomDelay  = 0.05;  /* the sheet is hidden, not awaited */
 static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
 static BOOL   g_cfgAppZoomBlur   = NO;    /* OFF for now - testing the flicker*/
+static BOOL   g_cfgAppZoomDirect = YES;   /* Path B: animate the live app host */
+static BOOL   g_cfgAppZoomHostFallback = NO; /* never fall back to screen shot */
 
 static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
 static BOOL     g_appZoomPlayed;
-static UIWindow *g_zoomWindow;
-static UIView   *g_zoomBlurHost;
-static UIView   *g_zoomSnap;
+static UIWindow *g_zoomWindow;             /* old screenshot path only         */
+static UIView   *g_zoomBlurHost;          /* old screenshot path only         */
+static UIView   *g_zoomSnap;              /* old screenshot path only         */
 static double   g_coverWindowLevel;
+static NSString *g_appZoomBundleID;
+static NSString *g_appZoomSceneID;
+static id        g_appZoomApplication;
+static id        g_appZoomScene;
+
+/* Path B state: the actual SpringBoard host for the app's remote CAContext. */
+static UIView    *g_appZoomHost;
+static CATransform3D g_appZoomHostBaseTransform;
+static BOOL      g_appZoomHostPrepared;
+static uint64_t  g_appZoomHostCycle;
+static BOOL      g_appZoomHostExternal;
+static id        g_appZoomHostManager;
+static NSString *g_appZoomHostRequester;
 
 static void   w26_appZoomTeardown(void);
 static void   w26_probeAppHost(void);
 static void   w26_appZoomBegin(void);
 static void   w26_appZoomPlay(void);
+static void   w26_appZoomHostRestore(void);
+static BOOL   w26_appZoomHostPrepare(void);
+static void   w26_appZoomHostAttempt(int attempt, uint64_t cycle);
 static BOOL   w26_unlockGoesToApp(void);
 
 static void w26_loadSettings(void) {
@@ -195,6 +213,10 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomNow    = [v boolValue];
     v = [d objectForKey:@"AppZoomHideSheetForSnapshot"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHide   = [v boolValue];
+    v = [d objectForKey:@"AppZoomDirectHost"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomDirect = [v boolValue];
+    v = [d objectForKey:@"AppZoomHostFallback"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHostFallback = [v boolValue];
     v = [d objectForKey:@"AppZoomBlur"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomBlur   = [v boolValue];
     v = [d objectForKey:@"AppZoomEarlyBlur"];
@@ -768,6 +790,10 @@ static void w26_armCycle(const char *why) {
     g_appZoomFlow      = NO;
     g_appZoomPlayed    = NO;
     w26_appZoomTeardown();
+    g_appZoomBundleID  = nil;
+    g_appZoomSceneID   = nil;
+    g_appZoomApplication = nil;
+    g_appZoomScene     = nil;
     w26_log(@"cycle armed (%s) id=%llu", why, (unsigned long long)g_cycleID);
 }
 
@@ -783,14 +809,356 @@ static void w26_retry(int attempt, uint64_t cycle, const char *reason) {
 #pragma mark - unlock into a running app: quick zoom-out + clearing blur
 /* ------------------------------------------------------------------ */
 
-/* SpringBoard does not own the app's own layers, so the zoom is played on a
- * snapshot of the screen instead - the running app sits underneath and the
- * snapshot lands exactly on top of it at scale 1.0, so the handover is
- * invisible.  The blur covers the one moment where they are swapped. */
+/* SpringBoard does not own the app's UIKit view hierarchy, but it does host
+ * the app's remote CAContext.  Path B transforms that existing host, so the
+ * running app itself zooms; no screen snapshot or image handover is involved. */
 
-/* Log-only.  Zooming a snapshot freezes the app for the length of the
- * animation; transforming the app's real host layer would not.  These lines
- * tell us what is actually reachable from inside SpringBoard. */
+/* Path B does not create a screenshot.  The running app is a remote
+ * CAContext, hosted by SpringBoard through a view such as SBAppView or
+ * FBSceneHostWrapperView.  Find that existing host and animate its layer.
+ * If the host cannot be identified, we deliberately do nothing rather than
+ * revive the old full-screen snapshot path (which is the source of ghosting).
+ */
+
+static id w26_msg(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static NSString *w26_bundleIDOfObject(id object) {
+    id bid = w26_msg(object, @selector(bundleIdentifier));
+    return [bid isKindOfClass:[NSString class]] ? bid : nil;
+}
+
+static NSString *w26_sceneIDOfObject(id object) {
+    id ident = w26_msg(object, @selector(identifier));
+    return [ident isKindOfClass:[NSString class]] ? ident : nil;
+}
+
+static BOOL w26_appObjectMatchesTarget(id object) {
+    if (!object) return NO;
+    if (object == g_appZoomApplication) return YES;
+    NSString *bid = w26_bundleIDOfObject(object);
+    return (g_appZoomBundleID.length && [bid isEqualToString:g_appZoomBundleID]);
+}
+
+static BOOL w26_sceneObjectMatchesTarget(id object) {
+    if (!object) return NO;
+    if (object == g_appZoomScene) return YES;
+    NSString *ident = w26_sceneIDOfObject(object);
+    return (g_appZoomSceneID.length && [ident isEqualToString:g_appZoomSceneID]);
+}
+
+/* Walk the responder chain as well as the view tree.  SBAppView's responder
+ * is normally SBAppViewController, which implements -hostedApp; a
+ * FBSceneHostWrapperView instead exposes -scene. */
+static BOOL w26_viewBelongsToTargetApp(UIView *view) {
+    id responder = view;
+    SEL hostedSEL = sel_registerName("hostedApp");
+    SEL applicationSEL = sel_registerName("application");
+    SEL sceneSEL = sel_registerName("scene");
+
+    for (int i = 0; responder && i < 12; i++) {
+        id hosted = w26_msg(responder, hostedSEL);
+        if (w26_appObjectMatchesTarget(hosted)) return YES;
+
+        id application = w26_msg(responder, applicationSEL);
+        if (w26_appObjectMatchesTarget(application)) return YES;
+
+        id scene = w26_msg(responder, sceneSEL);
+        if (w26_sceneObjectMatchesTarget(scene)) return YES;
+
+        if (![responder respondsToSelector:@selector(nextResponder)]) break;
+        id next = [responder nextResponder];
+        if (next == responder) break;
+        responder = next;
+    }
+    return NO;
+}
+
+static int w26_hostScore(UIView *view) {
+    NSString *name = NSStringFromClass([view class]);
+    if ([name isEqualToString:@"FBSceneHostWrapperView"] ||
+        [name containsString:@"SceneHostWrapper"]) return 120;
+    if ([name containsString:@"FBSceneHost"]) return 110;
+    if ([name isEqualToString:@"SBAppView"] ||
+        [name containsString:@"SBAppView"]) return 100;
+    if ([name containsString:@"HostWrapper"]) return 80;
+    if ([name containsString:@"HostView"]) return 70;
+    return 0;
+}
+
+static void w26_scanHostTree(UIView *view, UIView **best, int *bestScore,
+                             NSUInteger *visited, NSUInteger *candidateCount) {
+    if (!view || *visited >= 6000) return;
+    (*visited)++;
+
+    int score = w26_hostScore(view);
+    if (score > 0) {
+        (*candidateCount)++;
+        BOOL match = w26_viewBelongsToTargetApp(view);
+        if (*candidateCount <= 12) {
+            w26_log(@"[appzoom:host] candidate %@ match=%d frame=%@",
+                    NSStringFromClass([view class]), (int)match,
+                    NSStringFromCGRect(view.frame));
+        }
+        if (match && score > *bestScore) {
+            *best = view;
+            *bestScore = score;
+        }
+    }
+
+    for (UIView *child in view.subviews) {
+        w26_scanHostTree(child, best, bestScore, visited, candidateCount);
+        if (*visited >= 6000) break;
+    }
+}
+
+static UIView *w26_findAppHostView(void) {
+    if (!g_appZoomBundleID.length) return nil;
+
+    UIView *best = nil;
+    int bestScore = 0;
+    NSUInteger visited = 0;
+    NSUInteger candidates = 0;
+
+    for (UIWindow *window in w26_allWindows()) {
+        if (window == g_zoomWindow || window.hidden || window.alpha < 0.01) continue;
+        UIView *root = window.rootViewController.view;
+        if (root) {
+            w26_scanHostTree(root, &best, &bestScore, &visited, &candidates);
+        }
+    }
+
+    w26_log(@"[appzoom:host] scan app=%@ scene=%@ windows=%lu "
+            @"visited=%lu candidates=%lu best=%@ score=%d",
+            g_appZoomBundleID, g_appZoomSceneID,
+            (unsigned long)w26_allWindows().count,
+            (unsigned long)visited, (unsigned long)candidates,
+            best ? NSStringFromClass([best class]) : @"(none)", bestScore);
+    return best;
+}
+
+static void w26_appZoomHostRestore(void) {
+    if (!g_appZoomHost) {
+        g_appZoomHostPrepared = NO;
+        return;
+    }
+
+    CALayer *layer = g_appZoomHost.layer;
+    [layer removeAnimationForKey:@"wave26.appzoom.host"];
+    if (g_appZoomHostPrepared) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        layer.transform = g_appZoomHostBaseTransform;
+        [CATransaction commit];
+    }
+    if (g_appZoomHostExternal && g_appZoomHostManager &&
+        g_appZoomHostRequester.length) {
+        SEL disableSEL = sel_registerName("disableHostingForRequester:");
+        if ([g_appZoomHostManager respondsToSelector:disableSEL]) {
+            void (*disable)(id, SEL, NSString *) =
+                (void (*)(id, SEL, NSString *))objc_msgSend;
+            disable(g_appZoomHostManager, disableSEL, g_appZoomHostRequester);
+        }
+    }
+    if (g_appZoomHostExternal) {
+        [g_appZoomHost removeFromSuperview];
+        if (g_zoomWindow && !g_zoomSnap && !g_zoomBlurHost) {
+            g_zoomWindow.hidden = YES;
+            g_zoomWindow = nil;
+        }
+    }
+    w26_log(@"[appzoom:host] restored %@", NSStringFromClass([g_appZoomHost class]));
+    g_appZoomHost = nil;
+    g_appZoomHostPrepared = NO;
+    g_appZoomHostCycle = 0;
+    g_appZoomHostExternal = NO;
+    g_appZoomHostManager = nil;
+    g_appZoomHostRequester = nil;
+}
+
+static UIWindow *w26_makeLiveHostWindow(void) {
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    UIWindow *window = nil;
+    UIWindowScene *scene = nil;
+
+    for (UIScene *sc in [[UIApplication sharedApplication] connectedScenes]) {
+        if ([sc isKindOfClass:[UIWindowScene class]]) {
+            scene = (UIWindowScene *)sc;
+            break;
+        }
+    }
+    if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
+        window = [[UIWindow alloc] initWithWindowScene:scene];
+    }
+    if (!window) window = [[UIWindow alloc] initWithFrame:bounds];
+
+    double level = (g_coverWindowLevel > 1.0)
+                 ? (g_coverWindowLevel - 1.0) : 100.0;
+    window.frame = bounds;
+    window.windowLevel = level;
+    window.backgroundColor = [UIColor clearColor];
+    window.userInteractionEnabled = NO;
+    window.hidden = NO;
+    return window;
+}
+
+static UIView *w26_requestExternalHost(void) {
+    if (!g_appZoomScene) {
+        w26_log(@"[appzoom:host] no target FBScene");
+        return nil;
+    }
+
+    id manager = w26_msg(g_appZoomScene, @selector(contextHostManager));
+    SEL hostSEL = sel_registerName("hostViewForRequester:enableAndOrderFront:");
+    if (!manager || ![manager respondsToSelector:hostSEL]) {
+        w26_log(@"[appzoom:host] context host manager unavailable (%@)",
+                manager ? NSStringFromClass([manager class]) : @"(none)");
+        return nil;
+    }
+
+    NSString *requester = @"com.blu-tek.26Unlock.pathB";
+    UIView *(*call)(id, SEL, NSString *, BOOL) =
+        (UIView *(*)(id, SEL, NSString *, BOOL))objc_msgSend;
+    UIView *host = call(manager, hostSEL, requester, NO);
+    if (!host) {
+        w26_log(@"[appzoom:host] hostViewForRequester returned nil");
+        return nil;
+    }
+
+    g_appZoomHostManager = manager;
+    g_appZoomHostRequester = [requester copy];
+    g_appZoomHostExternal = YES;
+    w26_log(@"[appzoom:host] external host %@ manager=%@ super=%@",
+            NSStringFromClass([host class]), NSStringFromClass([manager class]),
+            host.superview ? NSStringFromClass([host.superview class]) : @"(none)");
+
+    /* If the manager returned an unattached wrapper, put the live remote
+     * surface in our transparent window. This is still Path B: no bitmap is
+     * created and the app keeps rendering through its CAContext. */
+    if (!host.superview) {
+        UIWindow *window = w26_makeLiveHostWindow();
+        if (!window) return nil;
+        host.frame = window.bounds;
+        host.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [window addSubview:host];
+        g_zoomWindow = window;
+    }
+    return host;
+}
+
+static BOOL w26_appZoomHostPrepare(void) {
+    if (!g_appZoomFlow || !g_cfgAppZoomDirect) return NO;
+    if (g_appZoomHostPrepared && g_appZoomHost &&
+        g_appZoomHostCycle == g_cycleID) return YES;
+
+    UIView *host = w26_findAppHostView();
+    if (!host) host = w26_requestExternalHost();
+    if (!host) return NO;
+
+    if (g_appZoomHost && g_appZoomHost != host) w26_appZoomHostRestore();
+
+    CALayer *layer = host.layer;
+    g_appZoomHost = host;
+    g_appZoomHostBaseTransform = layer.transform;
+
+    CATransform3D start = CATransform3DConcat(
+        g_appZoomHostBaseTransform,
+        CATransform3DMakeScale(g_cfgAppZoomScale, g_cfgAppZoomScale, 1.0));
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.transform = start;
+    [CATransaction commit];
+
+    g_appZoomHostPrepared = YES;
+    g_appZoomHostCycle = g_cycleID;
+    w26_log(@"[appzoom:host] prepared %@ frame=%@ scale=%.3f",
+            NSStringFromClass([host class]), NSStringFromCGRect(host.frame),
+            g_cfgAppZoomScale);
+    return YES;
+}
+
+static void w26_appZoomHostAnimate(void) {
+    if (!g_appZoomHostPrepared || !g_appZoomHost) return;
+
+    CALayer *layer = g_appZoomHost.layer;
+    CATransform3D start = layer.transform;
+    CATransform3D base = g_appZoomHostBaseTransform;
+
+    CASpringAnimation *spring =
+        [CASpringAnimation animationWithKeyPath:@"transform"];
+    spring.fromValue = [NSValue valueWithCATransform3D:start];
+    spring.toValue = [NSValue valueWithCATransform3D:base];
+    spring.damping = g_cfgAppZoomDamp;
+    spring.stiffness = g_cfgAppZoomStiff;
+    spring.mass = g_cfgAppZoomMassV;
+    spring.initialVelocity = 0.0;
+    spring.duration = g_cfgAppZoomDur;
+    spring.fillMode = kCAFillModeBackwards;
+    spring.removedOnCompletion = YES;
+    [layer addAnimation:spring forKey:@"wave26.appzoom.host"];
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.transform = base;
+    [CATransaction commit];
+
+    w26_log(@"[appzoom:host] play: %@ scale=%.3f dur=%.3f "
+            @"spring(damp=%.0f stiff=%.0f mass=%.1f)",
+            NSStringFromClass([g_appZoomHost class]), g_cfgAppZoomScale,
+            g_cfgAppZoomDur, g_cfgAppZoomDamp, g_cfgAppZoomStiff,
+            g_cfgAppZoomMassV);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)((g_cfgAppZoomDur + 0.08) * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (g_appZoomHost) {
+            [g_appZoomHost.layer removeAnimationForKey:@"wave26.appzoom.host"];
+            w26_log(@"[appzoom:host] done");
+        }
+        g_appZoomHostPrepared = NO;
+        g_appZoomHost = nil;
+        g_appZoomHostCycle = 0;
+    });
+}
+
+static void w26_appZoomHostAttempt(int attempt, uint64_t cycle) {
+    if (cycle != g_cycleID || !g_appZoomFlow || g_appZoomPlayed) return;
+
+    if (!w26_appZoomHostPrepare()) {
+        if (attempt == 0) w26_probeAppHost();
+        if (attempt == 0 || attempt == 5 || attempt == 10 || attempt == 19) {
+            w26_log(@"[appzoom:host] not found, retry=%d", attempt);
+        }
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                            (int64_t)(kW26RetryInterval * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                w26_appZoomHostAttempt(attempt + 1, cycle);
+            });
+            return;
+        }
+
+        g_appZoomPlayed = YES;
+        w26_log(@"[appzoom:host] unavailable after retries - no snapshot fallback");
+        if (g_cfgAppZoomHostFallback) {
+            w26_log(@"[appzoom:host] fallback requested; using legacy screen path");
+            g_cfgAppZoomDirect = NO;
+            g_appZoomPlayed = NO;
+            w26_appZoomPlay();
+        }
+        return;
+    }
+
+    g_appZoomPlayed = YES;
+    w26_appZoomHostAnimate();
+}
+
+/* Log-only fallback probe.  It remains useful when the direct host cannot be
+ * found, but the actual Path B resolver above is the code that animates. */
 static void w26_probeAppHost(void) {
     id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 
@@ -826,6 +1194,7 @@ static void w26_probeAppHost(void) {
 }
 
 static void w26_appZoomTeardown(void) {
+    w26_appZoomHostRestore();
     if (!g_zoomWindow) return;
     g_zoomWindow.hidden = YES;
     [g_zoomSnap removeFromSuperview];
@@ -836,6 +1205,7 @@ static void w26_appZoomTeardown(void) {
 }
 
 static void w26_appZoomBegin(void) {
+    if (g_cfgAppZoomDirect) return;
     if (g_zoomWindow) return;
 
     CGRect b = [UIScreen mainScreen].bounds;
@@ -884,12 +1254,19 @@ static void w26_appZoomBegin(void) {
 
 static void w26_appZoomPlay(void) {
     if (!g_appZoomFlow || g_appZoomPlayed) return;
-    g_appZoomPlayed = YES;
 
     /* Re-read the settings here too: this path never goes through w26_fire,
      * so without this every AppZoom* knob needed a respring. */
     w26_loadSettings();
 
+    /* Path B: transform the live app host.  Do not create a screen snapshot;
+     * the old path is retained only as an explicit diagnostic fallback. */
+    if (g_cfgAppZoomDirect) {
+        w26_appZoomHostAttempt(0, g_cycleID);
+        return;
+    }
+
+    g_appZoomPlayed = YES;
     CGRect b = [UIScreen mainScreen].bounds;
     if (CGRectIsEmpty(b)) { w26_appZoomTeardown(); return; }
 
@@ -1062,7 +1439,14 @@ static NSString *w26_frontmostBundleID(void) {
     }
     if (!bid && front) bid = NSStringFromClass([front class]);
 
-    w26_log(@"probe frontmost: method=%d id=%@", method, bid ? bid : @"(none)");
+    g_appZoomApplication = front;
+    g_appZoomBundleID = [bid copy];
+    g_appZoomScene = w26_msg(front, @selector(mainScene));
+    g_appZoomSceneID = [w26_sceneIDOfObject(g_appZoomScene) copy];
+
+    w26_log(@"probe frontmost: method=%d id=%@ scene=%@", method,
+            bid ? bid : @"(none)",
+            g_appZoomSceneID ? g_appZoomSceneID : @"(none)");
     return bid;
 }
 
@@ -1533,9 +1917,15 @@ static void w26_registerLockStateNotifications(void) {
 
         /* Works for both flows: passcode (no pan) and swipe (velocity already
          * captured).  This is the only place the unlock is confirmed. */
+        w26_loadSettings();
         g_appZoomFlow = w26_unlockGoesToApp();
-        if (g_appZoomFlow && g_cfgAppZoomEarly) {
-            w26_appZoomBegin();      /* blur while the lock screen leaves */
+        if (g_appZoomFlow && g_cfgAppZoomDirect) {
+            /* Prime the live host while the lock screen still covers it.
+             * This prevents an identity-frame flash before the spring starts. */
+            w26_appZoomHostPrepare();
+        }
+        if (g_appZoomFlow && g_cfgAppZoomEarly && !g_cfgAppZoomDirect) {
+            w26_appZoomBegin();      /* legacy screen path only */
         }
         w26_log(@"unlock confirmed (pan=%d) appZoom=%d",
                 (int)g_panFired, (int)g_appZoomFlow);
