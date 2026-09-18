@@ -126,6 +126,12 @@ static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
 
+double W26ScaleComp = 1.0;
+double W26DockTravel    = 380.0;   /* pt below home - binary value         */
+double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, too slow       */
+double W26DockDamping   = 22.0;    /* binary value, kept                   */
+double W26DockMass      = 1.0;     /* binary 1.5 -> now settles in ~0.36s  */
+
 static void w26_loadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
     if (![d isKindOfClass:[NSDictionary class]]) return;
@@ -136,6 +142,14 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitSettle  = [v boolValue];
     v = [d objectForKey:@"ScaleComp"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgScaleComp   = [v boolValue];
+    v = [d objectForKey:@"DockTravel"];
+    if ([v respondsToSelector:@selector(doubleValue)]) W26DockTravel    = [v doubleValue];
+    v = [d objectForKey:@"DockStiffness"];
+    if ([v respondsToSelector:@selector(doubleValue)]) W26DockStiffness = [v doubleValue];
+    v = [d objectForKey:@"DockDamping"];
+    if ([v respondsToSelector:@selector(doubleValue)]) W26DockDamping   = [v doubleValue];
+    v = [d objectForKey:@"DockMass"];
+    if ([v respondsToSelector:@selector(doubleValue)]) W26DockMass      = [v doubleValue];
     v = [d objectForKey:@"GuardDuration"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGuard       = [v doubleValue];
     v = [d objectForKey:@"WaitForStable"];
@@ -325,6 +339,28 @@ static void w26_stripIcon(UIView *view) {
             [path isEqualToString:@"transform"]) {
             [l removeAnimationForKey:k];
         }
+    }
+}
+
+/* Remove only the fade.  SpringBoard's own dock animation must survive:
+ * it is what brings the dock back from its pre-reveal position. */
+static void w26_stripFade(UIView *view) {
+    if (!view) return;
+    CALayer *l = view.layer;
+    if (!l) return;
+
+    for (NSString *k in [[l animationKeys] copy]) {
+        if ([k hasPrefix:@"wave26."]) continue;
+        CAAnimation *anim = [l animationForKey:k];
+        NSString *path = [anim isKindOfClass:[CAPropertyAnimation class]]
+                       ? [(CAPropertyAnimation *)anim keyPath] : nil;
+        if ([path isEqualToString:@"opacity"]) {
+            [l removeAnimationForKey:k];
+        }
+    }
+    if (view.alpha < 1.0) {
+        w26_log(@"  dock: alpha %.2f -> 1.00 (was fading in)", view.alpha);
+        view.alpha = 1.0;
     }
 }
 
@@ -530,12 +566,28 @@ static void w26_fire(double velocity, int attempt) {
     }
 
     UIView *dock = w26_findDockView();
+
+    if (dock) {
+        CALayer *dl = dock.layer;
+        CGPoint dm = dl ? dl.position : CGPointZero;
+        CGPoint dp = dl ? [[dl presentationLayer] position] : CGPointZero;
+        CGRect  dr = [dock convertRect:dock.bounds toView:nil];
+        CGRect  sb = [UIScreen mainScreen].bounds;
+        w26_log(@"probe dock: model=(%.1f,%.1f) pres=(%.1f,%.1f) alpha=%.2f "
+                @"windowMid=(%.1f,%.1f) onScreen=%d (screen h=%.0f)",
+                dm.x, dm.y, dp.x, dp.y, dock.alpha,
+                CGRectGetMidX(dr), CGRectGetMidY(dr),
+                (int)CGRectIntersectsRect(dr, sb), sb.size.height);
+    } else {
+        w26_log(@"probe dock: NOT FOUND");
+    }
+
     w26_registerHome(icons, dock);
 
     w26_probe(icons);
 
     for (UIView *view in icons) w26_stripIcon(view);
-    if (dock) w26_stripIcon(dock);
+    if (dock) w26_stripFade(dock);      /* keep SpringBoard's dock motion */
 
     for (UIView *view in icons) w26_neutralizeReveal(view, YES);
     if (dock) w26_neutralizeReveal(dock, YES);

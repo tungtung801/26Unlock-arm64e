@@ -13,6 +13,10 @@ static NSString * const kKeyScale = @"wave26.scale";
  * screen (unlock transition) every offset must be divided by that scale so the
  * icons still travel the same distance on screen.  1.0 == no compensation. */
 extern double W26ScaleComp;
+extern double W26DockTravel;     /* pt the dock starts below its home      */
+extern double W26DockStiffness;  /* binary: 115 - too slow next to the icons*/
+extern double W26DockDamping;    /* binary: 22                             */
+extern double W26DockMass;       /* binary: 1.5                            */
 static NSString * const kKeyDock  = @"wave26.dock";
 
 static const CGFloat kSpringMass = 1.5;
@@ -344,28 +348,37 @@ static const CGFloat kSpringMass = 1.5;
         return;
     }
 
-    CGPoint original = layer.position;
+    /* SpringBoard fades the dock in during the unlock.  That fade is what
+     * reads as "hide/show" and it hides the slide completely. */
+    dock.alpha = 1.0;
 
-    /* The dock starts 380 pt BELOW its home position and springs up into
-     * place.  Recovered from the original binary:
-     *   0x9f08  d0/d1 <- (x, y + 380)  -> valueWithCGPoint: -> setFromValue:
-     *   0x9f44  d0/d1 <- original      -> valueWithCGPoint: -> setToValue:
-     * The previous reconstruction had these two swapped, which made the dock
-     * slide DOWN and snap back - the "dock appears abruptly / jerks" bug. */
-    CGPoint target =
-        CGPointMake(original.x, original.y + 380.0 / W26ScaleComp);
+    double travel    = W26DockTravel    > 1.0  ? W26DockTravel    : 380.0;
+    double stiffness = W26DockStiffness > 1.0  ? W26DockStiffness : 200.0;
+    double damping   = W26DockDamping   > 1.0  ? W26DockDamping   : 22.0;
+    double mass      = W26DockMass      > 0.05 ? W26DockMass      : 1.0;
+
+    double scale = (W26ScaleComp > 0.2 && W26ScaleComp < 5.0) ? W26ScaleComp : 1.0;
+
+    /* Slide RELATIVE to wherever SpringBoard currently holds the dock:
+     * animate the transform, never the position.  While the unlock reveal is
+     * still running SpringBoard keeps the dock at its pre-reveal spot, so
+     * animating position slid the dock to that hidden spot - it only became
+     * visible once the reveal finished, which read as a late "hide/show". */
+    CATransform3D from =
+        CATransform3DMakeTranslation(0.0, travel / scale, 0.0);
+    CATransform3D to = CATransform3DIdentity;
 
     CFTimeInterval beginTime =
         [layer convertTime:CACurrentMediaTime() fromLayer:nil];
 
     CASpringAnimation *animation =
-        [CASpringAnimation animationWithKeyPath:@"position"];
+        [CASpringAnimation animationWithKeyPath:@"transform"];
 
-    animation.fromValue = [NSValue valueWithCGPoint:target];
-    animation.toValue = [NSValue valueWithCGPoint:original];
-    animation.damping = 22.0;
-    animation.stiffness = 115.0;
-    animation.mass = 1.5;
+    animation.fromValue = [NSValue valueWithCATransform3D:from];
+    animation.toValue   = [NSValue valueWithCATransform3D:to];
+    animation.damping = damping;
+    animation.stiffness = stiffness;
+    animation.mass = mass;
     animation.initialVelocity = 0.0;
     animation.duration = animation.settlingDuration;
     animation.beginTime = beginTime;
@@ -374,9 +387,8 @@ static const CGFloat kSpringMass = 1.5;
 
     [layer addAnimation:animation forKey:kKeyDock];
 
-    /* See animateIcon: commit the model value so removal doesn't pop the
-     * dock back to its pre-wave position. */
-    layer.position = original;
+    /* Commit the model value so removing the animation cannot pop the dock. */
+    layer.transform = CATransform3DIdentity;
 }
 
 - (void)reset {

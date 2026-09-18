@@ -9,13 +9,21 @@
 	<key>GridMinWidth</key>
 	<real>0.5</real>
 	<key>WaitForGrid</key>
-	<true/>
+	<false/>
 	<key>WaitForCoverSheet</key>
 	<false/>
 	<key>PinPresentation</key>
 	<true/>
 	<key>ScaleComp</key>
 	<true/>
+	<key>DockTravel</key>
+	<real>380.0</real>
+	<key>DockStiffness</key>
+	<real>200.0</real>
+	<key>DockDamping</key>
+	<real>22.0</real>
+	<key>DockMass</key>
+	<real>1.0</real>
 	<key>GuardDuration</key>
 	<real>0.6</real>
 	<key>ForcePresentation</key>
