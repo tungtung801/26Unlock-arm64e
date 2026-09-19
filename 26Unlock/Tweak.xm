@@ -157,6 +157,15 @@ static BOOL   g_cfgAppZoomBlur   = NO;    /* OFF for now - testing the flicker*/
 static BOOL   g_cfgAppZoomDirect = YES;   /* Path B: animate the live app host */
 static BOOL   g_cfgAppZoomHostFallback = NO; /* never fall back to screen shot */
 
+/* App-transition fail-safe.  This is intentionally separate from the wave:
+ * if SpringBoard restarts before the short boot grace period completes, the
+ * next load disables only AppZoom/mesh.  Unlock and NC wave hooks remain on. */
+#define W26_APPTRANSITION_BOOT_FILE @"/var/mobile/26Unlock.apptransition.boot"
+#define W26_APPTRANSITION_SAFE_FILE @"/var/mobile/26Unlock.apptransition.safe"
+static BOOL g_cfgAppTransitionSafeMode;
+static BOOL g_appTransitionSafeMode;
+static BOOL g_appTransitionSafetyArmed;
+
 /* Recovered 26Anim path.  This is separate from the unlock-to-app fallback
  * above: normal icon launches are driven by SBIconView's live transition
  * object, not by a screen snapshot or a uniform host scale. */
@@ -174,6 +183,11 @@ static const void *g_appMeshDisplayLinkKey = &g_appMeshDisplayLinkKey;
 static const void *g_appMeshSavedCRKey = &g_appMeshSavedCRKey;
 static const void *g_appMeshSavedMTBKey = &g_appMeshSavedMTBKey;
 static const void *g_appMeshSavedCurveKey = &g_appMeshSavedCurveKey;
+
+/* Runtime-only diagnostics for the A12/iOS 16 port.  These counters limit
+ * the log volume; they do not change the transition or its timing. */
+static NSUInteger g_appMeshTransformCallCount;
+static NSUInteger g_appMeshRuntimeShapeLogCount;
 
 static IMP w26_orig_iconSetHighlighted;
 static IMP w26_orig_iconDidMoveToWindow;
@@ -212,6 +226,8 @@ static void   w26_appZoomHostRestore(void);
 static BOOL   w26_appZoomHostPrepare(void);
 static void   w26_appZoomHostAttempt(int attempt, uint64_t cycle);
 static BOOL   w26_unlockGoesToApp(void);
+static void  w26_enterAppTransitionSafeMode(const char *reason);
+static void  w26_armAppTransitionSafety(void);
 
 static void w26_loadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:W26_SETTINGS];
@@ -249,6 +265,10 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomDirect = [v boolValue];
     v = [d objectForKey:@"AppZoomHostFallback"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHostFallback = [v boolValue];
+    v = [d objectForKey:@"AppTransitionSafeMode"];
+    if ([v respondsToSelector:@selector(boolValue)]) {
+        g_cfgAppTransitionSafeMode = [v boolValue];
+    }
     v = [d objectForKey:@"AppZoomMesh"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppMesh = [v boolValue];
     v = [d objectForKey:@"AppZoomMeshOpeningMask"];
@@ -295,6 +315,64 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgWaitGrid    = [v boolValue];
     v = [d objectForKey:@"GridMinWidth"];
     if ([v respondsToSelector:@selector(doubleValue)]) g_cfgGridMin     = [v doubleValue];
+
+    if (g_cfgAppTransitionSafeMode || g_appTransitionSafeMode) {
+        g_cfgAppZoom = NO;
+        g_cfgAppMesh = NO;
+        g_cfgAppZoomDirect = NO;
+        g_cfgAppZoomHostFallback = NO;
+    }
+}
+
+static void w26_enterAppTransitionSafeMode(const char *reason) {
+    g_appTransitionSafeMode = YES;
+    g_cfgAppZoom = NO;
+    g_cfgAppMesh = NO;
+    g_cfgAppZoomDirect = NO;
+    g_cfgAppZoomHostFallback = NO;
+
+    NSString *why = reason ? [NSString stringWithUTF8String:reason] : @"unknown";
+    NSDictionary *state = @{
+        @"reason": why,
+        @"date": [NSDate date]
+    };
+    [state writeToFile:W26_APPTRANSITION_SAFE_FILE atomically:YES];
+    w26_log(@"[apptransition:safe] ENABLED reason=%@; wave remains enabled", why);
+}
+
+static void w26_armAppTransitionSafety(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL bootMarker = [fm fileExistsAtPath:W26_APPTRANSITION_BOOT_FILE];
+    BOOL safeMarker = [fm fileExistsAtPath:W26_APPTRANSITION_SAFE_FILE];
+
+    if (safeMarker) {
+        w26_enterAppTransitionSafeMode("persistent safe marker");
+    } else if (bootMarker) {
+        w26_enterAppTransitionSafeMode(
+            "SpringBoard restarted before the previous safety window completed");
+    }
+
+    NSDictionary *boot = @{
+        @"pid": @([[NSProcessInfo processInfo] processIdentifier]),
+        @"date": [NSDate date]
+    };
+    [boot writeToFile:W26_APPTRANSITION_BOOT_FILE atomically:YES];
+    g_appTransitionSafetyArmed = YES;
+
+    /* A normal, stable SpringBoard clears the boot marker.  If it dies before
+     * this runs, the marker survives and the next load enters app-transition
+     * safe mode automatically. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)(30.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!g_appTransitionSafetyArmed) return;
+        g_appTransitionSafetyArmed = NO;
+        [[NSFileManager defaultManager]
+            removeItemAtPath:W26_APPTRANSITION_BOOT_FILE error:NULL];
+        w26_log(@"[apptransition:safe] boot window passed; transition=%@",
+                (g_appTransitionSafeMode || g_cfgAppTransitionSafeMode)
+                ? @"disabled" : @"enabled");
+    });
 }
 
 /* ------------------------------------------------------------------ */
@@ -417,6 +495,38 @@ static CGPoint w26_meshConvertPoint(id object, CGPoint point, id layer) {
 static NSArray *w26_meshSublayers(id object) {
     id value = w26_meshGetObject(object, @selector(sublayers));
     return [value isKindOfClass:[NSArray class]] ? value : nil;
+}
+
+static NSString *w26_meshDelegateClassName(id object) {
+    id delegate = w26_meshGetObject(object, @selector(delegate));
+    return delegate ? NSStringFromClass([delegate class]) : @"(nil)";
+}
+
+static BOOL w26_meshHasSurfaceSelectors(id object) {
+    return object &&
+           [object respondsToSelector:@selector(setMeshTransform:)] &&
+           [object respondsToSelector:@selector(setSublayerTransform:)] &&
+           [object respondsToSelector:@selector(presentationLayer)];
+}
+
+static void w26_meshLogRuntimeShape(id object, NSUInteger call) {
+    if (!object || g_appMeshRuntimeShapeLogCount >= 8) return;
+    g_appMeshRuntimeShapeLogCount++;
+
+    id layer = w26_meshGetObject(object, @selector(layer));
+    CGRect bounds = w26_meshGetBounds(object);
+    CGRect layerBounds = w26_meshGetBounds(layer);
+    w26_log(@"[appmesh] runtime #%lu object=%@ bounds=(%.1f,%.1f) "
+            @"delegate=%@ objectSurface=%d layer=%@ layerBounds=(%.1f,%.1f) "
+            @"layerSurface=%d fallback=%d",
+            (unsigned long)call,
+            NSStringFromClass([object class]), bounds.size.width, bounds.size.height,
+            w26_meshDelegateClassName(object),
+            (int)w26_meshHasSurfaceSelectors(object),
+            layer ? NSStringFromClass([layer class]) : @"(nil)",
+            layerBounds.size.width, layerBounds.size.height,
+            (int)w26_meshHasSurfaceSelectors(layer),
+            (int)g_cfgAppMeshLayerFallback);
 }
 
 static id w26_meshDisplayLinkOnChain(id target) {
@@ -613,6 +723,7 @@ static void w26_meshRestoreOpeningSublayers(id target) {
 @property(nonatomic) CGFloat directionY;
 @property(nonatomic) CGFloat state;
 @property(nonatomic) NSUInteger holdCounter;
+@property(nonatomic) BOOL appliedMesh;
 - (instancetype)initWithLayer:(id)layer;
 - (void)prepareForTransition:(id)target scalar:(CGFloat)scalar;
 - (void)tick:(CADisplayLink *)link;
@@ -637,6 +748,7 @@ static void w26_meshRestoreOpeningSublayers(id target) {
      * full-size and contracts.  This is the recovered ±0.15 state envelope. */
     self.state = self.opening ? 1.0 : 0.0;
     self.holdCounter = 0;
+    self.appliedMesh = NO;
 
     self.savedTargetState = [target respondsToSelector:@selector(cornerRadius)];
     if (self.savedTargetState) {
@@ -662,10 +774,13 @@ static void w26_meshRestoreOpeningSublayers(id target) {
     self.directionX = direction.x;
     self.directionY = direction.y;
 
+    CGRect targetBounds = w26_meshGetBounds(target);
     w26_log(@"[appmesh] begin %@ scalar=%.3f opening=%d anchor=(%.1f,%.1f) "
-            @"dir=(%.3f,%.3f)", NSStringFromClass([target class]), scalar,
+            @"dir=(%.3f,%.3f) bounds=(%.1f,%.1f) surface=%d",
+            NSStringFromClass([target class]), scalar,
             (int)self.opening, g_appMeshIconCenter.x, g_appMeshIconCenter.y,
-            self.directionX, self.directionY);
+            self.directionX, self.directionY, targetBounds.size.width,
+            targetBounds.size.height, (int)w26_meshHasSurfaceSelectors(target));
 }
 
 - (void)restoreTrackedIcons {
@@ -718,6 +833,11 @@ static void w26_meshRestoreOpeningSublayers(id target) {
     [CATransaction commit];
 
     [self restoreTrackedIcons];
+    if (self.appliedMesh) {
+        w26_log(@"[appmesh] cleanup target=%@ opening=%d",
+                target ? NSStringFromClass([target class]) : @"(nil)",
+                (int)self.opening);
+    }
     if (link) [link invalidate];
     if (target && objc_getAssociatedObject(target, g_appMeshDisplayLinkKey) == link) {
         objc_setAssociatedObject(target, g_appMeshDisplayLinkKey, nil,
@@ -773,8 +893,17 @@ static void w26_meshRestoreOpeningSublayers(id target) {
         return;
     }
 
-    id mesh = w26_meshCreateBulgedMesh(bulge, -self.directionX,
-                                       -self.directionY);
+    id mesh = nil;
+    @try {
+        mesh = w26_meshCreateBulgedMesh(bulge, -self.directionX,
+                                        -self.directionY);
+    } @catch (NSException *exception) {
+        w26_log(@"[appmesh] mesh factory exception %@: %@",
+                exception.name, exception.reason);
+        w26_enterAppTransitionSafeMode("CAMeshTransform factory exception");
+        [self cleanup];
+        return;
+    }
     if (!mesh) {
         [self cleanup];
         return;
@@ -787,6 +916,16 @@ static void w26_meshRestoreOpeningSublayers(id target) {
     w26_meshSetTransform(target, @selector(setSublayerTransform:),
                          CATransform3DMakeScale(scale, scale, 1.0));
     w26_meshSetBool(target, sel_registerName("setShouldRasterize:"), YES);
+
+    if (!self.appliedMesh) {
+        self.appliedMesh = YES;
+        w26_log(@"[appmesh] APPLY target=%@ opening=%d scalar=%.3f "
+                @"progress=%.3f state=%.3f bulge=%.3f dir=(%.3f,%.3f) "
+                @"openingMask=%d",
+                NSStringFromClass([target class]), (int)self.opening, scalar,
+                progress, self.state, bulge, self.directionX, self.directionY,
+                (int)(self.opening && g_cfgAppMeshOpeningMask));
+    }
 
     if (self.opening && g_cfgAppMeshOpeningMask) {
         w26_meshApplyOpeningSublayers(target, scalar, progress,
@@ -810,21 +949,30 @@ static void w26_meshRestoreOpeningSublayers(id target) {
 static id w26_meshTargetForObject(id object) {
     if (!object) return nil;
 
-    SEL meshSEL = @selector(setMeshTransform:);
-    SEL sublayerSEL = @selector(setSublayerTransform:);
-    if ([object respondsToSelector:meshSEL] &&
-        [object respondsToSelector:sublayerSEL] &&
-        [object respondsToSelector:@selector(presentationLayer)]) {
+    if (w26_meshHasSurfaceSelectors(object)) {
+        if (g_appMeshTransformCallCount <= 8) {
+            w26_log(@"[appmesh] target=object %@ (native transition surface)",
+                    NSStringFromClass([object class]));
+        }
         return object;
     }
 
     if (g_cfgAppMeshLayerFallback && [object respondsToSelector:@selector(layer)]) {
         id layer = w26_meshGetObject(object, @selector(layer));
-        if ([layer respondsToSelector:meshSEL] &&
-            [layer respondsToSelector:sublayerSEL] &&
-            [layer respondsToSelector:@selector(presentationLayer)]) {
+        if (w26_meshHasSurfaceSelectors(layer)) {
+            if (g_appMeshTransformCallCount <= 8) {
+                w26_log(@"[appmesh] target=layer %@ for object %@ (fallback)",
+                        NSStringFromClass([layer class]),
+                        NSStringFromClass([object class]));
+            }
             return layer;
         }
+    }
+
+    if (g_appMeshTransformCallCount <= 8) {
+        w26_log(@"[appmesh] target unavailable for %@ (fallback=%d)",
+                NSStringFromClass([object class]),
+                (int)g_cfgAppMeshLayerFallback);
     }
     return nil;
 }
@@ -887,10 +1035,29 @@ static void w26_meshStartForTarget(id target, double scalar) {
 
 static void w26_meshObserveTransform(id object, double scalar) {
     if (!g_cfgAppZoom || !g_cfgAppMesh || !object) return;
-    if (!w26_meshDelegateIsEligible(object)) return;
+
+    NSUInteger call = ++g_appMeshTransformCallCount;
+    w26_meshLogRuntimeShape(object, call);
+
+    BOOL eligible = w26_meshDelegateIsEligible(object);
+    if (!eligible) {
+        if (call <= 8) {
+            w26_log(@"[appmesh] reject #%lu: delegate %@ is not one of "
+                    @"SBCrossfadeView/SBFullscreenZoomView/"
+                    @"SBReusableSnapshotItemContainer",
+                    (unsigned long)call, w26_meshDelegateClassName(object));
+        }
+        return;
+    }
 
     CGRect bounds = w26_meshGetBounds(object);
-    if (bounds.size.width <= 200.0 || bounds.size.height <= 400.0) return;
+    if (bounds.size.width <= 200.0 || bounds.size.height <= 400.0) {
+        if (call <= 8) {
+            w26_log(@"[appmesh] reject #%lu: bounds too small %.1fx%.1f",
+                    (unsigned long)call, bounds.size.width, bounds.size.height);
+        }
+        return;
+    }
 
     id target = w26_meshTargetForObject(object);
     if (!target) return;
@@ -912,9 +1079,15 @@ static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
     g_appMeshIconCenter = CGPointMake(CGRectGetMidX(inWindow),
                                       CGRectGetMidY(inWindow));
     g_appMeshHasIconCenter = YES;
-    w26_log(@"[appmesh] highlighted anchor=(%.1f,%.1f) window=%@",
+    /* Start a fresh bounded diagnostic window for this launch/close gesture;
+     * normal home-layout transforms before the tap must not consume it. */
+    g_appMeshTransformCallCount = 0;
+    g_appMeshRuntimeShapeLogCount = 0;
+    w26_log(@"[appmesh] highlighted anchor=(%.1f,%.1f) iconRectInWindow=%@ "
+            @"window=%@ windowBounds=%@",
             g_appMeshIconCenter.x, g_appMeshIconCenter.y,
-            NSStringFromClass([window class]));
+            NSStringFromCGRect(inWindow), NSStringFromClass([window class]),
+            NSStringFromCGRect(window.bounds));
 }
 
 static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
@@ -953,6 +1126,14 @@ static BOOL w26_installAppMeshHooks(void) {
         return NO;
     }
 
+    Class meshClass = NSClassFromString(@"CAMeshTransform");
+    SEL meshFactory = sel_registerName(
+        "meshTransformWithVertexCount:vertices:faceCount:faces:depthNormalization:");
+    w26_log(@"[appmesh] runtime meshClass=%@ factory=%d fallback=%d mask=%d",
+            meshClass ? NSStringFromClass(meshClass) : @"(nil)",
+            (int)(meshClass && [meshClass respondsToSelector:meshFactory]),
+            (int)g_cfgAppMeshLayerFallback, (int)g_cfgAppMeshOpeningMask);
+
     BOOL highlighted = w26_swizzle(cls, @selector(setHighlighted:),
                                    (IMP)w26_iconSetHighlighted,
                                    &w26_orig_iconSetHighlighted);
@@ -987,9 +1168,11 @@ static BOOL w26_installAppMeshHooks(void) {
     }
 
     g_appMeshHooksInstalled = highlighted && moved && transform;
-    w26_log(@"[appmesh] hooks highlighted=%d moved=%d transform=%d delegates="
+    w26_log(@"[appmesh] hooks highlighted=%d moved=%d transform=%d "
+            @"mesh=%d fallback=%d delegates="
             @"SBCrossfadeView/SBFullscreenZoomView/SBReusableSnapshotItemContainer",
-            (int)highlighted, (int)moved, (int)transform);
+            (int)highlighted, (int)moved, (int)transform,
+            (int)g_cfgAppMesh, (int)g_cfgAppMeshLayerFallback);
     return g_appMeshHooksInstalled;
 }
 
@@ -2651,6 +2834,7 @@ static void w26_init(void) {
     g_dockClass = NSClassFromString(@"SBDockView");
     g_haveCoverClass = (NSClassFromString(@"SBCoverSheetViewController") != nil);
     w26_loadSettings();
+    w26_armAppTransitionSafety();
 
     g_engine = [WaveEngine new];
 

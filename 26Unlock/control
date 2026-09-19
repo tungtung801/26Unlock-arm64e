@@ -1,6 +1,6 @@
 Package: com.blu-tek.26wave
 Name: 26Unlock
-Version: 0.5.7
+Version: 0.5.9
 Architecture: iphoneos-arm64
 Description: iOS 26 unlock wave effect (arm64 + arm64e, rootless)
 Maintainer: blu-tek

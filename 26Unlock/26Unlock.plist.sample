@@ -22,6 +22,8 @@
 	<real>1.10</real>
 	<key>AppZoom</key>
 	<true/>
+	<key>AppTransitionSafeMode</key>
+	<false/>
 	<key>AppZoomDirectHost</key>
 	<true/>
 	<key>AppZoomHostFallback</key>
