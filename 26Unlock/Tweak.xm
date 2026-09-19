@@ -211,6 +211,7 @@ static BOOL g_normalAppTransitionPlayed;
 static BOOL g_normalAppTransitionClosing;
 static uint64_t g_normalAppTransitionToken;
 static NSString *g_normalAppBundleID;
+static __weak UIView *g_normalTransitionSurfaceCandidate;
 
 typedef struct {
     Class cls;
@@ -218,20 +219,33 @@ typedef struct {
     BOOL isCATransform3D;
 } W26TransitionTransformHook;
 
-static W26TransitionTransformHook g_appMeshTransitionHooks[4];
+static W26TransitionTransformHook g_appMeshTransitionHooks[12];
 static NSUInteger g_appMeshTransitionHookCount;
 
 static IMP w26_orig_iconSetHighlighted;
 static IMP w26_orig_iconDidMoveToWindow;
 static IMP w26_orig_iconSetTransform3D;
 static IMP w26_orig_iconSetTransformAffine;
+static IMP w26_orig_iconTouchesEnded;
+static IMP w26_orig_iconActivate;
+static IMP w26_orig_iconLaunch;
+static IMP w26_orig_iconOpen;
 static IMP w26_orig_iconsFlyInTension;
 static IMP w26_orig_iconsFlyInFriction;
 static BOOL g_appMeshSettingsHooksInstalled;
 
+typedef struct {
+    SEL selector;
+    IMP original;
+    unsigned argumentCount;
+} W26ActivationHook;
+static W26ActivationHook g_appMeshActivationHooks[8];
+static NSUInteger g_appMeshActivationHookCount;
+
 static BOOL      w26_installAppMeshHooks(void);
 static void      w26_meshStartForTarget(id target, double scalar);
 static void      w26_meshObserveTransform(id target, double scalar);
+static void      w26_normalTransitionSurfaceTransform(id object, double scalar);
 
 static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
 static BOOL     g_appZoomPlayed;
@@ -391,11 +405,20 @@ static void w26_armAppTransitionSafety(void) {
     BOOL bootMarker = [fm fileExistsAtPath:W26_APPTRANSITION_BOOT_FILE];
     BOOL safeMarker = [fm fileExistsAtPath:W26_APPTRANSITION_SAFE_FILE];
 
-    if (safeMarker) {
+    if (g_cfgAppTransitionSafeMode && safeMarker) {
         w26_enterAppTransitionSafeMode("persistent safe marker");
-    } else if (bootMarker) {
+    } else if (g_cfgAppTransitionSafeMode && bootMarker) {
         w26_enterAppTransitionSafeMode(
             "SpringBoard restarted before the previous safety window completed");
+    } else if (safeMarker || bootMarker) {
+        /* A previous experimental build can leave these markers behind.  Do
+         * not silently disable the app path when the current plist explicitly
+         * has AppTransitionSafeMode=false; that made every later test look
+         * like a missing host while the wave continued to work. */
+        [fm removeItemAtPath:W26_APPTRANSITION_SAFE_FILE error:NULL];
+        [fm removeItemAtPath:W26_APPTRANSITION_BOOT_FILE error:NULL];
+        g_appTransitionSafeMode = NO;
+        w26_log(@"[apptransition:safe] stale markers cleared (setting disabled)");
     }
 
     NSDictionary *boot = @{
@@ -557,12 +580,26 @@ static BOOL w26_meshHasSurfaceSelectors(id object) {
 
 static BOOL w26_meshIsKnownTransitionSurface(id object) {
     if (!object) return NO;
-    Class crossfade = NSClassFromString(@"SBCrossfadeView");
-    Class fullscreen = NSClassFromString(@"SBFullscreenZoomView");
-    Class snapshot = NSClassFromString(@"SBReusableSnapshotItemContainer");
-    return (crossfade && [object isKindOfClass:crossfade]) ||
-           (fullscreen && [object isKindOfClass:fullscreen]) ||
-           (snapshot && [object isKindOfClass:snapshot]);
+    NSArray *names = @[
+        @"SBCrossfadeView",
+        @"SBFullscreenZoomView",
+        @"SBReusableSnapshotItemContainer",
+        @"SBAppView",
+        @"SBApplicationView",
+        @"SBApplicationSceneView",
+        @"SBApplicationHostView",
+        @"SBSceneView",
+        @"SBSceneHostWrapperView",
+        @"SBMainSceneHostView",
+        @"FBSceneHostWrapperView",
+        @"FBSceneHostView",
+        @"SBUIRemoteView"
+    ];
+    for (NSString *name in names) {
+        Class cls = NSClassFromString(name);
+        if (cls && [object isKindOfClass:cls]) return YES;
+    }
+    return NO;
 }
 
 static void w26_meshLogRuntimeShape(id object, NSUInteger call) {
@@ -1153,18 +1190,15 @@ static void w26_meshObserveTransform(id object, double scalar) {
     w26_meshStartForTarget(target, scalar);
 }
 
-static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
-    if (w26_orig_iconSetHighlighted) {
-        ((void (*)(id, SEL, BOOL))w26_orig_iconSetHighlighted)(self, _cmd,
-                                                               highlighted);
+static BOOL w26_captureIconAnchor(id icon, NSString *source) {
+    id window = w26_meshGetObject(icon, @selector(window));
+    if (!window || ![icon respondsToSelector:@selector(convertRect:toView:)]) {
+        return NO;
     }
-    if (!highlighted || !g_cfgAppMesh) return;
 
-    id window = w26_meshGetObject(self, @selector(window));
-    if (!window || ![self respondsToSelector:@selector(convertRect:toView:)]) return;
-    CGRect bounds = w26_meshGetBounds(self);
+    CGRect bounds = w26_meshGetBounds(icon);
     CGRect inWindow = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(
-        self, @selector(convertRect:toView:), bounds, window);
+        icon, @selector(convertRect:toView:), bounds, window);
     g_appMeshIconCenter = CGPointMake(CGRectGetMidX(inWindow),
                                       CGRectGetMidY(inWindow));
     g_appMeshHasIconCenter = YES;
@@ -1174,28 +1208,113 @@ static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
     g_appMeshRuntimeShapeLogCount = 0;
     g_appMeshNativeSurfaceObserved = NO;
     g_appMeshIconWindow = window;
-    w26_log(@"[appmesh] highlighted anchor=(%.1f,%.1f) iconRectInWindow=%@ "
+    w26_log(@"[appmesh] %@ anchor=(%.1f,%.1f) iconRectInWindow=%@ "
             @"window=%@ windowBounds=%@",
-            g_appMeshIconCenter.x, g_appMeshIconCenter.y,
+            source, g_appMeshIconCenter.x, g_appMeshIconCenter.y,
             NSStringFromCGRect(inWindow), NSStringFromClass([window class]),
             NSStringFromCGRect(w26_meshGetBounds(window)));
+    return YES;
+}
+
+static void w26_scheduleNormalAppTransition(void) {
+    if (!g_cfgAppMesh || !g_cfgAppZoomDirect || g_onLockScreen ||
+        g_appZoomFlow || !g_appMeshHasIconCenter) return;
+    if (g_normalAppTransitionArmed && !g_normalAppTransitionPlayed) return;
 
     /* On iOS 16 the icon often does not forward the full-screen layer
      * surface. Arm the live-host compatibility route immediately after the
      * tap; it will cancel itself if the native mesh target appears first. */
-    if (!g_onLockScreen && !g_appZoomFlow && g_cfgAppMesh &&
-        g_cfgAppZoomDirect) {
-        g_normalAppTransitionArmed = YES;
-        g_normalAppTransitionPlayed = NO;
-        g_normalAppTransitionClosing = NO;
-        g_normalAppTransitionToken++;
-        uint64_t token = g_normalAppTransitionToken;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                      (int64_t)(0.03 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            w26_normalAppTransitionAttempt(0, token);
-        });
+    g_normalAppTransitionArmed = YES;
+    g_normalAppTransitionPlayed = NO;
+    g_normalAppTransitionClosing = NO;
+    g_normalAppTransitionToken++;
+    uint64_t token = g_normalAppTransitionToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                  (int64_t)(0.03 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        w26_normalAppTransitionAttempt(0, token);
+    });
+}
+
+static void w26_armNormalAppTransitionFromIcon(id icon, NSString *source) {
+    if (!g_cfgAppMesh || !g_cfgAppZoomDirect || g_onLockScreen ||
+        g_appZoomFlow || (g_normalAppTransitionArmed &&
+                          !g_normalAppTransitionPlayed)) return;
+    if (w26_captureIconAnchor(icon, source)) {
+        w26_scheduleNormalAppTransition();
     }
+}
+
+static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
+    if (w26_orig_iconSetHighlighted) {
+        ((void (*)(id, SEL, BOOL))w26_orig_iconSetHighlighted)(self, _cmd,
+                                                               highlighted);
+    }
+    if (!highlighted || !g_cfgAppMesh) return;
+    if (w26_captureIconAnchor(self, @"highlighted")) {
+        w26_scheduleNormalAppTransition();
+    }
+}
+
+static void w26_iconTouchesEnded(id self, SEL _cmd, NSSet *touches,
+                                  UIEvent *event) {
+    if (w26_orig_iconTouchesEnded) {
+        ((void (*)(id, SEL, NSSet *, UIEvent *))w26_orig_iconTouchesEnded)(
+            self, _cmd, touches, event);
+    }
+    w26_armNormalAppTransitionFromIcon(self, @"touchesEnded");
+}
+
+static void w26_iconActivate(id self, SEL _cmd) {
+    w26_armNormalAppTransitionFromIcon(self, @"activate");
+    if (w26_orig_iconActivate) {
+        ((void (*)(id, SEL))w26_orig_iconActivate)(self, _cmd);
+    }
+}
+
+static void w26_iconLaunch(id self, SEL _cmd) {
+    w26_armNormalAppTransitionFromIcon(self, @"launch");
+    if (w26_orig_iconLaunch) {
+        ((void (*)(id, SEL))w26_orig_iconLaunch)(self, _cmd);
+    }
+}
+
+static void w26_iconOpen(id self, SEL _cmd) {
+    w26_armNormalAppTransitionFromIcon(self, @"open");
+    if (w26_orig_iconOpen) {
+        ((void (*)(id, SEL))w26_orig_iconOpen)(self, _cmd);
+    }
+}
+
+static IMP w26_activationOriginal(SEL selector, unsigned argumentCount) {
+    for (NSUInteger i = 0; i < g_appMeshActivationHookCount; i++) {
+        W26ActivationHook hook = g_appMeshActivationHooks[i];
+        if (hook.selector == selector && hook.argumentCount == argumentCount) {
+            return hook.original;
+        }
+    }
+    return NULL;
+}
+
+static void w26_armIconArgument(id object, NSString *source) {
+    if (g_iconClass && object && [object isKindOfClass:g_iconClass]) {
+        w26_armNormalAppTransitionFromIcon(object, source);
+    }
+}
+
+static void w26_iconControllerActivateOne(id self, SEL _cmd, id object) {
+    w26_armIconArgument(object, @"controller");
+    IMP original = w26_activationOriginal(_cmd, 3);
+    if (original) ((void (*)(id, SEL, id))original)(self, _cmd, object);
+}
+
+static void w26_iconControllerActivateTwo(id self, SEL _cmd,
+                                          id first, id second) {
+    w26_armIconArgument(first, @"controller");
+    w26_armIconArgument(second, @"controller");
+    IMP original = w26_activationOriginal(_cmd, 4);
+    if (original) ((void (*)(id, SEL, id, id))original)(self, _cmd,
+                                                         first, second);
 }
 
 static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
@@ -1228,6 +1347,7 @@ static void w26_transitionSetTransform3D(id self, SEL _cmd,
         ((void (*)(id, SEL, CATransform3D))original)(self, _cmd, transform);
     }
     w26_meshObserveTransform(self, transform.m11);
+    w26_normalTransitionSurfaceTransform(self, transform.m11);
 }
 
 static void w26_transitionSetTransformAffine(id self, SEL _cmd,
@@ -1237,6 +1357,52 @@ static void w26_transitionSetTransformAffine(id self, SEL _cmd,
         ((void (*)(id, SEL, CGAffineTransform))original)(self, _cmd, transform);
     }
     w26_meshObserveTransform(self, transform.a);
+    w26_normalTransitionSurfaceTransform(self, transform.a);
+}
+
+static BOOL w26_methodIsVoidWithArguments(Class cls, SEL sel,
+                                          unsigned arguments) {
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method || method_getNumberOfArguments(method) != arguments) return NO;
+    char *returnType = method_copyReturnType(method);
+    BOOL result = returnType && returnType[0] == 'v';
+    if (returnType) free(returnType);
+    return result;
+}
+
+static BOOL w26_installActivationHook(Class cls, SEL selector,
+                                      unsigned arguments) {
+    if (!cls || !selector || g_appMeshActivationHookCount >=
+                           (sizeof(g_appMeshActivationHooks) /
+                            sizeof(g_appMeshActivationHooks[0]))) return NO;
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != arguments) return NO;
+    char *returnType = method_copyReturnType(method);
+    BOOL isVoid = returnType && returnType[0] == 'v';
+    if (returnType) free(returnType);
+    if (!isVoid) return NO;
+
+    for (unsigned i = 2; i < arguments; i++) {
+        char *type = method_copyArgumentType(method, i);
+        BOOL object = type && type[0] == '@';
+        if (type) free(type);
+        if (!object) return NO;
+    }
+
+    IMP replacement = (arguments == 3)
+                    ? (IMP)w26_iconControllerActivateOne
+                    : (IMP)w26_iconControllerActivateTwo;
+    IMP original = NULL;
+    if (!w26_swizzle(cls, selector, replacement, &original) || !original) return NO;
+
+    W26ActivationHook *slot =
+        &g_appMeshActivationHooks[g_appMeshActivationHookCount++];
+    slot->selector = selector;
+    slot->original = original;
+    slot->argumentCount = arguments;
+    w26_log(@"[appmesh] icon-controller activation hook %@ args=%u",
+            NSStringFromSelector(selector), arguments);
+    return YES;
 }
 
 static BOOL w26_installTransitionSurfaceHook(Class cls) {
@@ -1363,7 +1529,17 @@ static BOOL w26_installAppMeshHooks(void) {
         NSArray *names = @[
             @"SBCrossfadeView",
             @"SBFullscreenZoomView",
-            @"SBReusableSnapshotItemContainer"
+            @"SBReusableSnapshotItemContainer",
+            @"SBAppView",
+            @"SBApplicationView",
+            @"SBApplicationSceneView",
+            @"SBApplicationHostView",
+            @"SBSceneView",
+            @"SBSceneHostWrapperView",
+            @"SBMainSceneHostView",
+            @"FBSceneHostWrapperView",
+            @"FBSceneHostView",
+            @"SBUIRemoteView"
         ];
         for (NSString *name in names) {
             Class transitionClass = NSClassFromString(name);
@@ -1376,11 +1552,36 @@ static BOOL w26_installAppMeshHooks(void) {
         }
     }
 
+    Class iconController = NSClassFromString(@"SBIconController");
+    if (iconController && g_appMeshActivationHookCount == 0) {
+        NSArray *twoArgumentSelectors = @[
+            @"iconView:didActivateIcon:",
+            @"iconView:willActivateIcon:",
+            @"iconView:openApplication:",
+            @"openApplication:fromIconView:",
+            @"activateIcon:fromIconView:"
+        ];
+        NSArray *oneArgumentSelectors = @[
+            @"activateIcon:",
+            @"launchIcon:"
+        ];
+        for (NSString *name in twoArgumentSelectors) {
+            w26_installActivationHook(iconController,
+                                      NSSelectorFromString(name), 4);
+        }
+        for (NSString *name in oneArgumentSelectors) {
+            w26_installActivationHook(iconController,
+                                      NSSelectorFromString(name), 3);
+        }
+    }
+
     if (!cls) {
-        w26_log(@"[appmesh] SBIconView unavailable; transitionHooks=%d",
-                (int)transitionHooks);
-        g_appMeshHooksInstalled = transitionHooks;
-        return transitionHooks;
+        w26_log(@"[appmesh] SBIconView unavailable; transitionHooks=%d "
+                @"activationHooks=%lu", (int)transitionHooks,
+                (unsigned long)g_appMeshActivationHookCount);
+        g_appMeshHooksInstalled = transitionHooks ||
+                                  g_appMeshActivationHookCount > 0;
+        return g_appMeshHooksInstalled;
     }
 
     Class meshClass = NSClassFromString(@"CAMeshTransform");
@@ -1397,6 +1598,35 @@ static BOOL w26_installAppMeshHooks(void) {
     BOOL moved = w26_swizzle(cls, @selector(didMoveToWindow),
                              (IMP)w26_iconDidMoveToWindow,
                              &w26_orig_iconDidMoveToWindow);
+
+    BOOL touches = NO;
+    SEL touchesSEL = @selector(touchesEnded:withEvent:);
+    if (w26_methodIsVoidWithArguments(cls, touchesSEL, 4)) {
+        touches = w26_swizzle(cls, touchesSEL, (IMP)w26_iconTouchesEnded,
+                              &w26_orig_iconTouchesEnded);
+    }
+
+    BOOL activate = NO;
+    BOOL launch = NO;
+    BOOL open = NO;
+    SEL activateSEL = NSSelectorFromString(@"activate");
+    SEL launchSEL = NSSelectorFromString(@"launch");
+    SEL openSEL = NSSelectorFromString(@"open");
+    if (w26_methodIsVoidWithArguments(cls, activateSEL, 2)) {
+        activate = w26_swizzle(cls, activateSEL, (IMP)w26_iconActivate,
+                               &w26_orig_iconActivate);
+    }
+    if (w26_methodIsVoidWithArguments(cls, launchSEL, 2)) {
+        launch = w26_swizzle(cls, launchSEL, (IMP)w26_iconLaunch,
+                             &w26_orig_iconLaunch);
+    }
+    if (w26_methodIsVoidWithArguments(cls, openSEL, 2)) {
+        open = w26_swizzle(cls, openSEL, (IMP)w26_iconOpen,
+                           &w26_orig_iconOpen);
+    }
+    w26_log(@"[appmesh] icon activation hooks touches=%d activate=%d "
+            @"launch=%d open=%d", (int)touches, (int)activate,
+            (int)launch, (int)open);
 
     Method transformMethod = class_getInstanceMethod(cls, @selector(setTransform:));
     BOOL transform = NO;
@@ -1427,10 +1657,12 @@ static BOOL w26_installAppMeshHooks(void) {
     g_appMeshHooksInstalled = transitionHooks ||
                               (highlighted && moved && transform);
     w26_log(@"[appmesh] hooks highlighted=%d moved=%d transform=%d "
-            @"transition=%d transitionCount=%lu mesh=%d fallback=%d delegates="
+            @"transition=%d transitionCount=%lu activationCount=%lu "
+            @"mesh=%d fallback=%d delegates="
             @"SBCrossfadeView/SBFullscreenZoomView/SBReusableSnapshotItemContainer",
             (int)highlighted, (int)moved, (int)transform,
             (int)transitionHooks, (unsigned long)g_appMeshTransitionHookCount,
+            (unsigned long)g_appMeshActivationHookCount,
             (int)g_cfgAppMesh, (int)g_cfgAppMeshLayerFallback);
     return g_appMeshHooksInstalled;
 }
@@ -2042,6 +2274,10 @@ static int w26_hostScore(UIView *view) {
         [name containsString:@"SBAppView"]) return 100;
     if ([name containsString:@"HostWrapper"]) return 80;
     if ([name containsString:@"HostView"]) return 70;
+    if ([name containsString:@"Application"] &&
+        [name containsString:@"View"]) return 65;
+    if ([name containsString:@"App"] && [name containsString:@"View"]) return 60;
+    if ([name containsString:@"Remote"] && [name containsString:@"View"]) return 55;
     return 0;
 }
 
@@ -2059,9 +2295,22 @@ static void w26_scanHostTree(UIView *view, UIView **best, int *bestScore,
                     NSStringFromClass([view class]), (int)match,
                     NSStringFromCGRect(view.frame));
         }
-        if (match && score > *bestScore) {
+        BOOL broadCandidate = NO;
+        if (g_normalAppTransitionArmed && !match) {
+            NSString *className = NSStringFromClass([view class]);
+            BOOL appNamed = [className containsString:@"App"] ||
+                            [className containsString:@"Application"] ||
+                            [className containsString:@"SceneHost"];
+            CGRect frame = view.bounds;
+            CGRect screen = [UIScreen mainScreen].bounds;
+            broadCandidate = appNamed &&
+                             frame.size.width >= screen.size.width * 0.70 &&
+                             frame.size.height >= screen.size.height * 0.70;
+        }
+        int rank = match ? score + 1000 : score;
+        if ((match || broadCandidate) && rank > *bestScore) {
             *best = view;
-            *bestScore = score;
+            *bestScore = rank;
         }
     }
 
@@ -2072,7 +2321,8 @@ static void w26_scanHostTree(UIView *view, UIView **best, int *bestScore,
 }
 
 static UIView *w26_findAppHostView(void) {
-    if (!g_appZoomBundleID.length) return nil;
+    BOOL allowBroadNormalScan = g_normalAppTransitionArmed;
+    if (!g_appZoomBundleID.length && !allowBroadNormalScan) return nil;
 
     UIView *best = nil;
     int bestScore = 0;
@@ -2135,6 +2385,7 @@ static void w26_appZoomHostRestore(void) {
     g_appZoomHostExternal = NO;
     g_appZoomHostNormalTransition = NO;
     g_appZoomHostClosing = NO;
+    g_normalTransitionSurfaceCandidate = nil;
     g_appZoomHostManager = nil;
     g_appZoomHostRequester = nil;
 }
@@ -2228,8 +2479,11 @@ static BOOL w26_appZoomHostPrepare(void) {
         g_appZoomHostNormalTransition == normalTransition &&
         g_appZoomHostClosing == closing) return YES;
 
-    UIView *host = w26_findAppHostView();
-    if (!host) host = w26_requestExternalHost();
+    UIView *host = normalTransition ? g_normalTransitionSurfaceCandidate : nil;
+    if (!host) host = w26_findAppHostView();
+    if (!host && (!normalTransition || g_appZoomBundleID.length)) {
+        host = w26_requestExternalHost();
+    }
     if (!host) return NO;
 
     if (g_appZoomHost && g_appZoomHost != host) w26_appZoomHostRestore();
@@ -2336,7 +2590,27 @@ static void w26_appZoomHostAnimate(void) {
         g_appZoomHostCycle = 0;
         g_appZoomHostNormalTransition = NO;
         g_appZoomHostClosing = NO;
+        g_normalTransitionSurfaceCandidate = nil;
     });
+}
+
+static void w26_normalTransitionSurfaceTransform(id object, double scalar) {
+    (void)scalar;
+    if (!g_normalAppTransitionArmed || g_normalAppTransitionPlayed ||
+        !g_cfgAppMesh || !g_cfgAppZoomDirect || g_onLockScreen ||
+        !w26_meshIsKnownTransitionSurface(object) ||
+        ![object respondsToSelector:@selector(layer)]) return;
+
+    CGRect bounds = w26_meshGetBounds(object);
+    if (bounds.size.width <= 200.0 || bounds.size.height <= 400.0) return;
+
+    g_normalTransitionSurfaceCandidate = (UIView *)object;
+    if (w26_appZoomHostPrepare()) {
+        g_normalAppTransitionPlayed = YES;
+        w26_log(@"[appzoom:host] using transition surface %@ directly",
+                NSStringFromClass([object class]));
+        w26_appZoomHostAnimate();
+    }
 }
 
 static void w26_normalAppTransitionAttempt(int attempt, uint64_t token) {
@@ -2348,31 +2622,19 @@ static void w26_normalAppTransitionAttempt(int attempt, uint64_t token) {
     BOOL closing = g_normalAppTransitionClosing;
     if (!closing) {
         NSString *frontmost = w26_frontmostBundleID();
-        if (!frontmost.length ||
-            [frontmost isEqualToString:@"com.apple.springboard"] ||
-            [frontmost hasPrefix:@"SB"]) {
-            if (attempt < 20) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                (int64_t)(kW26RetryInterval * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    w26_normalAppTransitionAttempt(attempt + 1, token);
-                });
-            } else {
-                g_normalAppTransitionArmed = NO;
-                g_normalAppTransitionPlayed = YES;
-                w26_log(@"[appzoom:host] normal open did not reach an app");
-            }
-            return;
+        BOOL looksLikeApp = frontmost.length &&
+            ![frontmost isEqualToString:@"com.apple.springboard"] &&
+            ![frontmost hasPrefix:@"SB"];
+        if (looksLikeApp) {
+            g_normalAppBundleID = [frontmost copy];
+            g_appZoomBundleID = [g_normalAppBundleID copy];
+        } else if (attempt == 0 || attempt == 5 || attempt == 10) {
+            w26_log(@"[appzoom:host] frontmost=%@; broad host scan allowed",
+                    frontmost ?: @"(none)");
         }
-        g_normalAppBundleID = [frontmost copy];
+    } else if (g_normalAppBundleID.length) {
+        g_appZoomBundleID = [g_normalAppBundleID copy];
     }
-
-    if (!g_normalAppBundleID.length) {
-        g_normalAppTransitionArmed = NO;
-        g_normalAppTransitionPlayed = YES;
-        return;
-    }
-    g_appZoomBundleID = [g_normalAppBundleID copy];
 
     if (!w26_appZoomHostPrepare()) {
         if (attempt == 0 || attempt == 5 || attempt == 10 || attempt == 19) {
