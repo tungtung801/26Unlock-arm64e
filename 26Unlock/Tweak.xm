@@ -172,15 +172,11 @@ static const void *g_appMeshDisplayLinkKey = &g_appMeshDisplayLinkKey;
 static const void *g_appMeshSavedCRKey = &g_appMeshSavedCRKey;
 static const void *g_appMeshSavedMTBKey = &g_appMeshSavedMTBKey;
 static const void *g_appMeshSavedCurveKey = &g_appMeshSavedCurveKey;
-static const void *g_appMeshSavedMaskKey = &g_appMeshSavedMaskKey;
 
 static IMP w26_orig_iconSetHighlighted;
 static IMP w26_orig_iconDidMoveToWindow;
 static IMP w26_orig_iconSetTransform3D;
 static IMP w26_orig_iconSetTransformAffine;
-
-static BOOL      g_appMeshObservedTransition;
-static uint64_t  g_appMeshObservedCycle;
 
 static BOOL      w26_installAppMeshHooks(void);
 static void      w26_meshStartForTarget(id target, double scalar);
@@ -727,7 +723,6 @@ static void w26_meshRestoreOpeningSublayers(id target) {
     self.directionX = 0.0;
     self.directionY = 0.0;
     g_appMeshHasIconCenter = NO;
-    g_appMeshObservedTransition = NO;
 }
 
 - (void)tick:(CADisplayLink *)link {
@@ -879,7 +874,6 @@ static void w26_meshStartForTarget(id target, double scalar) {
         link.preferredFramesPerSecond = fps;
     }
     [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    g_appMeshObservedTransition = YES;
     w26_log(@"[appmesh] display link installed target=%@ scalar=%.3f",
             NSStringFromClass([target class]), scalar);
 }
