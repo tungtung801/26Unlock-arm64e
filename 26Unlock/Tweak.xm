@@ -168,6 +168,7 @@ static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
 static BOOL   g_cfgAppZoomBlur   = NO;    /* OFF for now - testing the flicker*/
 static BOOL   g_cfgAppZoomDirect = YES;   /* Path B: animate the live app host */
 static BOOL   g_cfgAppZoomHostFallback = NO; /* never fall back to screen shot */
+static double g_cfgAppLaunchScale = 0.14; /* iOS 16 host starts at the tapped icon */
 
 /* App-transition fail-safe.  This is intentionally separate from the wave:
  * if SpringBoard restarts before the short boot grace period completes, the
@@ -200,11 +201,33 @@ static const void *g_appMeshSavedCurveKey = &g_appMeshSavedCurveKey;
  * the log volume; they do not change the transition or its timing. */
 static NSUInteger g_appMeshTransformCallCount;
 static NSUInteger g_appMeshRuntimeShapeLogCount;
+static BOOL g_appMeshNativeSurfaceObserved;
+static __weak UIWindow *g_appMeshIconWindow;
+
+/* iOS 16 host activation: SBIconView is the reliable tap/anchor signal,
+ * while the app's remote CAContext appears a few frames later. */
+static BOOL g_normalAppTransitionArmed;
+static BOOL g_normalAppTransitionPlayed;
+static BOOL g_normalAppTransitionClosing;
+static uint64_t g_normalAppTransitionToken;
+static NSString *g_normalAppBundleID;
+
+typedef struct {
+    Class cls;
+    IMP original;
+    BOOL isCATransform3D;
+} W26TransitionTransformHook;
+
+static W26TransitionTransformHook g_appMeshTransitionHooks[4];
+static NSUInteger g_appMeshTransitionHookCount;
 
 static IMP w26_orig_iconSetHighlighted;
 static IMP w26_orig_iconDidMoveToWindow;
 static IMP w26_orig_iconSetTransform3D;
 static IMP w26_orig_iconSetTransformAffine;
+static IMP w26_orig_iconsFlyInTension;
+static IMP w26_orig_iconsFlyInFriction;
+static BOOL g_appMeshSettingsHooksInstalled;
 
 static BOOL      w26_installAppMeshHooks(void);
 static void      w26_meshStartForTarget(id target, double scalar);
@@ -227,6 +250,10 @@ static CATransform3D g_appZoomHostBaseTransform;
 static BOOL      g_appZoomHostPrepared;
 static uint64_t  g_appZoomHostCycle;
 static BOOL      g_appZoomHostExternal;
+static BOOL      g_appZoomHostNormalTransition;
+static BOOL      g_appZoomHostClosing;
+static CGPoint   g_appZoomHostPivot;
+static CATransform3D g_appZoomHostTargetTransform;
 static id        g_appZoomHostManager;
 static NSString *g_appZoomHostRequester;
 
@@ -237,6 +264,8 @@ static void   w26_appZoomPlay(void);
 static void   w26_appZoomHostRestore(void);
 static BOOL   w26_appZoomHostPrepare(void);
 static void   w26_appZoomHostAttempt(int attempt, uint64_t cycle);
+static void   w26_normalAppTransitionAttempt(int attempt, uint64_t token);
+static NSString *w26_frontmostBundleID(void);
 static BOOL   w26_unlockGoesToApp(void);
 static void  w26_enterAppTransitionSafeMode(const char *reason);
 static void  w26_armAppTransitionSafety(void);
@@ -277,6 +306,11 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomDirect = [v boolValue];
     v = [d objectForKey:@"AppZoomHostFallback"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHostFallback = [v boolValue];
+    v = [d objectForKey:@"AppZoomLaunchScale"];
+    if ([v respondsToSelector:@selector(doubleValue)]) {
+        double scale = [v doubleValue];
+        if (scale >= 0.05 && scale <= 0.50) g_cfgAppLaunchScale = scale;
+    }
     v = [d objectForKey:@"AppTransitionSafeMode"];
     if ([v respondsToSelector:@selector(boolValue)]) {
         g_cfgAppTransitionSafeMode = [v boolValue];
@@ -519,6 +553,16 @@ static BOOL w26_meshHasSurfaceSelectors(id object) {
            [object respondsToSelector:@selector(setMeshTransform:)] &&
            [object respondsToSelector:@selector(setSublayerTransform:)] &&
            [object respondsToSelector:@selector(presentationLayer)];
+}
+
+static BOOL w26_meshIsKnownTransitionSurface(id object) {
+    if (!object) return NO;
+    Class crossfade = NSClassFromString(@"SBCrossfadeView");
+    Class fullscreen = NSClassFromString(@"SBFullscreenZoomView");
+    Class snapshot = NSClassFromString(@"SBReusableSnapshotItemContainer");
+    return (crossfade && [object isKindOfClass:crossfade]) ||
+           (fullscreen && [object isKindOfClass:fullscreen]) ||
+           (snapshot && [object isKindOfClass:snapshot]);
 }
 
 static void w26_meshLogRuntimeShape(id object, NSUInteger call) {
@@ -969,7 +1013,13 @@ static id w26_meshTargetForObject(id object) {
         return object;
     }
 
-    if (g_cfgAppMeshLayerFallback && [object respondsToSelector:@selector(layer)]) {
+    /* The iOS 16 transition classes do not necessarily forward the private
+     * mesh surface through the view object.  The recovered iOS 26 binary
+     * names these classes explicitly, so permit their layer as a capability-
+     * checked fallback even when the user setting remains off. */
+    BOOL knownTransitionSurface = w26_meshIsKnownTransitionSurface(object);
+    if ((g_cfgAppMeshLayerFallback || knownTransitionSurface) &&
+        [object respondsToSelector:@selector(layer)]) {
         id layer = w26_meshGetObject(object, @selector(layer));
         if (w26_meshHasSurfaceSelectors(layer)) {
             if (g_appMeshTransformCallCount <= 8) {
@@ -991,7 +1041,13 @@ static id w26_meshTargetForObject(id object) {
 
 static BOOL w26_meshDelegateIsEligible(id object) {
     id delegate = w26_meshGetObject(object, @selector(delegate));
-    if (!delegate) return NO;
+    BOOL nativeSurface = w26_meshHasSurfaceSelectors(object);
+    if (!nativeSurface && w26_meshIsKnownTransitionSurface(object) &&
+        [object respondsToSelector:@selector(layer)]) {
+        nativeSurface = w26_meshHasSurfaceSelectors(
+            w26_meshGetObject(object, @selector(layer)));
+    }
+    if (!delegate && !nativeSurface) return NO;
 
     Class allowed[3] = {
         NSClassFromString(@"SBCrossfadeView"),
@@ -1006,13 +1062,25 @@ static BOOL w26_meshDelegateIsEligible(id object) {
             break;
         }
     }
+
+    /* iOS 16 may expose the live transition surface directly but use a
+     * different/private delegate class than the iOS 26 binary.  A native
+     * mesh-capable target is safer evidence than the delegate name alone. */
+    if (!match && nativeSurface) {
+        w26_log(@"[appmesh] accepting native transition surface object=%@ delegate %@",
+                NSStringFromClass([object class]),
+                delegate ? NSStringFromClass([delegate class]) : @"(nil)");
+        match = YES;
+    }
     return match;
 }
 
 static void w26_meshStartForTarget(id target, double scalar) {
-    if (!target || !g_cfgAppZoom || !g_cfgAppMesh) return;
+    /* Normal icon open/close mesh is independent from the separate unlock-
+     * directly-into-an-app AppZoom path. */
+    if (!target || !g_cfgAppMesh) return;
     w26_loadSettings();
-    if (!g_cfgAppZoom || !g_cfgAppMesh) return;
+    if (!g_cfgAppMesh) return;
 
     if (!NSClassFromString(@"CAMeshTransform")) {
         if (!g_appMeshLoggedUnavailable) {
@@ -1046,7 +1114,7 @@ static void w26_meshStartForTarget(id target, double scalar) {
 }
 
 static void w26_meshObserveTransform(id object, double scalar) {
-    if (!g_cfgAppZoom || !g_cfgAppMesh || !object) return;
+    if (!g_cfgAppMesh || !object) return;
 
     NSUInteger call = ++g_appMeshTransformCallCount;
     w26_meshLogRuntimeShape(object, call);
@@ -1073,6 +1141,15 @@ static void w26_meshObserveTransform(id object, double scalar) {
 
     id target = w26_meshTargetForObject(object);
     if (!target) return;
+
+    /* If the native/private surface is present, it is the preferred path.
+     * Cancel the iOS 16 host fallback so opening never gets two transforms. */
+    if (g_normalAppTransitionArmed) {
+        g_appMeshNativeSurfaceObserved = YES;
+        g_normalAppTransitionArmed = NO;
+        g_normalAppTransitionToken++;
+        w26_log(@"[appmesh] native transition surface won over host fallback");
+    }
     w26_meshStartForTarget(target, scalar);
 }
 
@@ -1081,7 +1158,7 @@ static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
         ((void (*)(id, SEL, BOOL))w26_orig_iconSetHighlighted)(self, _cmd,
                                                                highlighted);
     }
-    if (!highlighted || !g_cfgAppZoom || !g_cfgAppMesh) return;
+    if (!highlighted || !g_cfgAppMesh) return;
 
     id window = w26_meshGetObject(self, @selector(window));
     if (!window || ![self respondsToSelector:@selector(convertRect:toView:)]) return;
@@ -1095,11 +1172,30 @@ static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
      * normal home-layout transforms before the tap must not consume it. */
     g_appMeshTransformCallCount = 0;
     g_appMeshRuntimeShapeLogCount = 0;
+    g_appMeshNativeSurfaceObserved = NO;
+    g_appMeshIconWindow = window;
     w26_log(@"[appmesh] highlighted anchor=(%.1f,%.1f) iconRectInWindow=%@ "
             @"window=%@ windowBounds=%@",
             g_appMeshIconCenter.x, g_appMeshIconCenter.y,
             NSStringFromCGRect(inWindow), NSStringFromClass([window class]),
             NSStringFromCGRect(w26_meshGetBounds(window)));
+
+    /* On iOS 16 the icon often does not forward the full-screen layer
+     * surface. Arm the live-host compatibility route immediately after the
+     * tap; it will cancel itself if the native mesh target appears first. */
+    if (!g_onLockScreen && !g_appZoomFlow && g_cfgAppMesh &&
+        g_cfgAppZoomDirect) {
+        g_normalAppTransitionArmed = YES;
+        g_normalAppTransitionPlayed = NO;
+        g_normalAppTransitionClosing = NO;
+        g_normalAppTransitionToken++;
+        uint64_t token = g_normalAppTransitionToken;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                      (int64_t)(0.03 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            w26_normalAppTransitionAttempt(0, token);
+        });
+    }
 }
 
 static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
@@ -1111,6 +1207,87 @@ static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
     }
     id window = w26_meshGetObject(self, @selector(window));
     if (window) [g_appMeshGrabberViews addObject:self];
+}
+
+static IMP w26_transitionOriginalForObject(id object, BOOL isCATransform3D) {
+    if (!object) return NULL;
+    for (NSUInteger i = 0; i < g_appMeshTransitionHookCount; i++) {
+        W26TransitionTransformHook hook = g_appMeshTransitionHooks[i];
+        if (hook.isCATransform3D == isCATransform3D &&
+            hook.cls && [object isKindOfClass:hook.cls]) {
+            return hook.original;
+        }
+    }
+    return NULL;
+}
+
+static void w26_transitionSetTransform3D(id self, SEL _cmd,
+                                         CATransform3D transform) {
+    IMP original = w26_transitionOriginalForObject(self, YES);
+    if (original) {
+        ((void (*)(id, SEL, CATransform3D))original)(self, _cmd, transform);
+    }
+    w26_meshObserveTransform(self, transform.m11);
+}
+
+static void w26_transitionSetTransformAffine(id self, SEL _cmd,
+                                             CGAffineTransform transform) {
+    IMP original = w26_transitionOriginalForObject(self, NO);
+    if (original) {
+        ((void (*)(id, SEL, CGAffineTransform))original)(self, _cmd, transform);
+    }
+    w26_meshObserveTransform(self, transform.a);
+}
+
+static BOOL w26_installTransitionSurfaceHook(Class cls) {
+    if (!cls || g_appMeshTransitionHookCount >=
+                (sizeof(g_appMeshTransitionHooks) /
+                 sizeof(g_appMeshTransitionHooks[0]))) {
+        return NO;
+    }
+
+    Method method = class_getInstanceMethod(cls, @selector(setTransform:));
+    if (!method || method_getNumberOfArguments(method) != 3) return NO;
+
+    char *argType = method_copyArgumentType(method, 2);
+    const char *encoding = argType ?: "";
+    NSUInteger doubleCount = 0;
+    for (const char *p = encoding; *p; p++) {
+        if (*p == 'd') doubleCount++;
+    }
+
+    BOOL isCATransform3D = strstr(encoding, "CATransform3D") ||
+                           doubleCount >= 12;
+    BOOL isCGAffine = strstr(encoding, "CGAffineTransform") ||
+                      doubleCount >= 4;
+    IMP original = NULL;
+    BOOL installed = NO;
+    if (isCATransform3D) {
+        installed = w26_swizzle(cls, @selector(setTransform:),
+                                (IMP)w26_transitionSetTransform3D,
+                                &original);
+    } else if (isCGAffine) {
+        installed = w26_swizzle(cls, @selector(setTransform:),
+                                (IMP)w26_transitionSetTransformAffine,
+                                &original);
+    }
+
+    if (installed && original) {
+        W26TransitionTransformHook *slot =
+            &g_appMeshTransitionHooks[g_appMeshTransitionHookCount++];
+        slot->cls = cls;
+        slot->original = original;
+        slot->isCATransform3D = isCATransform3D;
+        w26_log(@"[appmesh] transition hook %@ setTransform ABI=%@",
+                NSStringFromClass(cls),
+                isCATransform3D ? @"CATransform3D" : @"CGAffineTransform");
+    } else {
+        w26_log(@"[appmesh] transition hook %@ skipped ABI=%s installed=%d",
+                NSStringFromClass(cls), encoding, (int)installed);
+    }
+
+    if (argType) free(argType);
+    return installed;
 }
 
 static void w26_iconSetTransform3D(id self, SEL _cmd, CATransform3D transform) {
@@ -1130,12 +1307,80 @@ static void w26_iconSetTransformAffine(id self, SEL _cmd,
     w26_meshObserveTransform(self, transform.a);
 }
 
+static double w26_settingsIconsFlyInTension(id self, SEL _cmd) {
+    double value = w26_orig_iconsFlyInTension
+        ? ((double (*)(id, SEL))w26_orig_iconsFlyInTension)(self, _cmd)
+        : 0.0;
+    /* These are the two functional SpringBoard settings changes in 26Anim
+     * (the other recovered settings replacements return their original
+     * object/scalar after integrity bookkeeping). */
+    if (g_cfgAppMesh &&
+        (g_normalAppTransitionArmed || g_appMeshNativeSurfaceObserved) &&
+        isfinite(value)) return value * 0.70;
+    return value;
+}
+
+static double w26_settingsIconsFlyInFriction(id self, SEL _cmd) {
+    double value = w26_orig_iconsFlyInFriction
+        ? ((double (*)(id, SEL))w26_orig_iconsFlyInFriction)(self, _cmd)
+        : 0.0;
+    if (g_cfgAppMesh &&
+        (g_normalAppTransitionArmed || g_appMeshNativeSurfaceObserved) &&
+        isfinite(value)) return value * 0.80;
+    return value;
+}
+
+static BOOL w26_installAnimationSettingsHooks(void) {
+    if (g_appMeshSettingsHooksInstalled) return YES;
+
+    Class cls = NSClassFromString(@"CSCoverSheetFlyInSettings");
+    if (!cls) {
+        w26_log(@"[appmesh] CSCoverSheetFlyInSettings unavailable");
+        return NO;
+    }
+
+    BOOL tension = w26_swizzle(
+        cls, NSSelectorFromString(@"iconsFlyInTension"),
+        (IMP)w26_settingsIconsFlyInTension, &w26_orig_iconsFlyInTension);
+    BOOL friction = w26_swizzle(
+        cls, NSSelectorFromString(@"iconsFlyInFriction"),
+        (IMP)w26_settingsIconsFlyInFriction, &w26_orig_iconsFlyInFriction);
+
+    g_appMeshSettingsHooksInstalled = tension && friction;
+    w26_log(@"[appmesh] SpringBoard settings hooks class=%@ tension=%d "
+            @"friction=%d (26Anim factors .70/.80)",
+            NSStringFromClass(cls), (int)tension, (int)friction);
+    return g_appMeshSettingsHooksInstalled;
+}
+
 static BOOL w26_installAppMeshHooks(void) {
+    w26_installAnimationSettingsHooks();
     if (!g_iconClass) g_iconClass = NSClassFromString(@"SBIconView");
     Class cls = g_iconClass;
+
+    BOOL transitionHooks = (g_appMeshTransitionHookCount > 0);
+    if (!transitionHooks) {
+        NSArray *names = @[
+            @"SBCrossfadeView",
+            @"SBFullscreenZoomView",
+            @"SBReusableSnapshotItemContainer"
+        ];
+        for (NSString *name in names) {
+            Class transitionClass = NSClassFromString(name);
+            if (transitionClass &&
+                w26_installTransitionSurfaceHook(transitionClass)) {
+                transitionHooks = YES;
+            } else if (!transitionClass) {
+                w26_log(@"[appmesh] transition class %@ unavailable", name);
+            }
+        }
+    }
+
     if (!cls) {
-        w26_log(@"[appmesh] SBIconView unavailable");
-        return NO;
+        w26_log(@"[appmesh] SBIconView unavailable; transitionHooks=%d",
+                (int)transitionHooks);
+        g_appMeshHooksInstalled = transitionHooks;
+        return transitionHooks;
     }
 
     Class meshClass = NSClassFromString(@"CAMeshTransform");
@@ -1179,11 +1424,13 @@ static BOOL w26_installAppMeshHooks(void) {
         if (argType) free(argType);
     }
 
-    g_appMeshHooksInstalled = highlighted && moved && transform;
+    g_appMeshHooksInstalled = transitionHooks ||
+                              (highlighted && moved && transform);
     w26_log(@"[appmesh] hooks highlighted=%d moved=%d transform=%d "
-            @"mesh=%d fallback=%d delegates="
+            @"transition=%d transitionCount=%lu mesh=%d fallback=%d delegates="
             @"SBCrossfadeView/SBFullscreenZoomView/SBReusableSnapshotItemContainer",
             (int)highlighted, (int)moved, (int)transform,
+            (int)transitionHooks, (unsigned long)g_appMeshTransitionHookCount,
             (int)g_cfgAppMesh, (int)g_cfgAppMeshLayerFallback);
     return g_appMeshHooksInstalled;
 }
@@ -1693,6 +1940,12 @@ static void w26_armCycle(const char *why) {
     g_prevCenters      = nil;
     g_appZoomFlow      = NO;
     g_appZoomPlayed    = NO;
+    g_normalAppTransitionArmed = NO;
+    g_normalAppTransitionPlayed = NO;
+    g_normalAppTransitionClosing = NO;
+    g_appMeshNativeSurfaceObserved = NO;
+    g_normalAppTransitionToken++;
+    g_normalAppBundleID = nil;
     w26_appZoomTeardown();
     g_appZoomBundleID  = nil;
     g_appZoomSceneID   = nil;
@@ -1846,6 +2099,8 @@ static UIView *w26_findAppHostView(void) {
 static void w26_appZoomHostRestore(void) {
     if (!g_appZoomHost) {
         g_appZoomHostPrepared = NO;
+        g_appZoomHostNormalTransition = NO;
+        g_appZoomHostClosing = NO;
         return;
     }
 
@@ -1878,6 +2133,8 @@ static void w26_appZoomHostRestore(void) {
     g_appZoomHostPrepared = NO;
     g_appZoomHostCycle = 0;
     g_appZoomHostExternal = NO;
+    g_appZoomHostNormalTransition = NO;
+    g_appZoomHostClosing = NO;
     g_appZoomHostManager = nil;
     g_appZoomHostRequester = nil;
 }
@@ -1953,10 +2210,23 @@ static UIView *w26_requestExternalHost(void) {
     return host;
 }
 
+static CATransform3D w26_scaleAboutPoint(CGFloat scale, CGPoint point) {
+    CATransform3D transform = CATransform3DMakeTranslation(point.x, point.y, 0.0);
+    transform = CATransform3DConcat(transform,
+                                    CATransform3DMakeScale(scale, scale, 1.0));
+    transform = CATransform3DConcat(
+        transform, CATransform3DMakeTranslation(-point.x, -point.y, 0.0));
+    return transform;
+}
+
 static BOOL w26_appZoomHostPrepare(void) {
-    if (!g_appZoomFlow || !g_cfgAppZoomDirect) return NO;
+    BOOL normalTransition = g_normalAppTransitionArmed;
+    BOOL closing = normalTransition && g_normalAppTransitionClosing;
+    if ((!g_appZoomFlow && !normalTransition) || !g_cfgAppZoomDirect) return NO;
     if (g_appZoomHostPrepared && g_appZoomHost &&
-        g_appZoomHostCycle == g_cycleID) return YES;
+        g_appZoomHostCycle == g_cycleID &&
+        g_appZoomHostNormalTransition == normalTransition &&
+        g_appZoomHostClosing == closing) return YES;
 
     UIView *host = w26_findAppHostView();
     if (!host) host = w26_requestExternalHost();
@@ -1966,11 +2236,38 @@ static BOOL w26_appZoomHostPrepare(void) {
 
     CALayer *layer = host.layer;
     g_appZoomHost = host;
-    g_appZoomHostBaseTransform = layer.transform;
+    if (normalTransition) {
+        /* Take over the live host at its current presentation frame instead
+         * of stacking a second scale on SpringBoard's native transform. */
+        CALayer *presentation = layer.presentationLayer;
+        g_appZoomHostBaseTransform = presentation
+                                   ? presentation.transform : layer.transform;
+        [layer removeAnimationForKey:@"transform"];
+    } else {
+        g_appZoomHostBaseTransform = layer.transform;
+    }
+    g_appZoomHostNormalTransition = normalTransition;
+    g_appZoomHostClosing = closing;
 
-    CATransform3D start = CATransform3DConcat(
-        g_appZoomHostBaseTransform,
-        CATransform3DMakeScale(g_cfgAppZoomScale, g_cfgAppZoomScale, 1.0));
+    CGFloat scale = normalTransition ? g_cfgAppLaunchScale : g_cfgAppZoomScale;
+    CGPoint pivot = CGPointMake(CGRectGetMidX(host.bounds),
+                                CGRectGetMidY(host.bounds));
+    if (normalTransition && g_appMeshHasIconCenter && g_appMeshIconWindow &&
+        [g_appMeshIconWindow respondsToSelector:@selector(convertPoint:toView:)]) {
+        pivot = [g_appMeshIconWindow convertPoint:g_appMeshIconCenter toView:host];
+    }
+    if (!isfinite(pivot.x) || !isfinite(pivot.y)) {
+        pivot = CGPointMake(CGRectGetMidX(host.bounds),
+                            CGRectGetMidY(host.bounds));
+    }
+    g_appZoomHostPivot = pivot;
+
+    CATransform3D scaleTransform = w26_scaleAboutPoint(scale, pivot);
+    CATransform3D scaled = CATransform3DConcat(
+        g_appZoomHostBaseTransform, scaleTransform);
+    CATransform3D start = closing ? g_appZoomHostBaseTransform : scaled;
+    g_appZoomHostTargetTransform = closing ? scaled
+                                           : g_appZoomHostBaseTransform;
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -1979,9 +2276,10 @@ static BOOL w26_appZoomHostPrepare(void) {
 
     g_appZoomHostPrepared = YES;
     g_appZoomHostCycle = g_cycleID;
-    w26_log(@"[appzoom:host] prepared %@ frame=%@ scale=%.3f",
+    w26_log(@"[appzoom:host] prepared %@ frame=%@ scale=%.3f "
+            @"pivot=(%.1f,%.1f) normal=%d closing=%d",
             NSStringFromClass([host class]), NSStringFromCGRect(host.frame),
-            g_cfgAppZoomScale);
+            scale, pivot.x, pivot.y, (int)normalTransition, (int)closing);
     return YES;
 }
 
@@ -1990,12 +2288,14 @@ static void w26_appZoomHostAnimate(void) {
 
     CALayer *layer = g_appZoomHost.layer;
     CATransform3D start = layer.transform;
-    CATransform3D base = g_appZoomHostBaseTransform;
+    CATransform3D target = g_appZoomHostTargetTransform;
+    CGFloat scale = g_appZoomHostNormalTransition
+                  ? g_cfgAppLaunchScale : g_cfgAppZoomScale;
 
     CASpringAnimation *spring =
         [CASpringAnimation animationWithKeyPath:@"transform"];
     spring.fromValue = [NSValue valueWithCATransform3D:start];
-    spring.toValue = [NSValue valueWithCATransform3D:base];
+    spring.toValue = [NSValue valueWithCATransform3D:target];
     spring.damping = g_cfgAppZoomDamp;
     spring.stiffness = g_cfgAppZoomStiff;
     spring.mass = g_cfgAppZoomMassV;
@@ -2007,14 +2307,17 @@ static void w26_appZoomHostAnimate(void) {
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    layer.transform = base;
+    layer.transform = target;
     [CATransaction commit];
 
     w26_log(@"[appzoom:host] play: %@ scale=%.3f dur=%.3f "
+            @"pivot=(%.1f,%.1f) normal=%d closing=%d "
             @"spring(damp=%.0f stiff=%.0f mass=%.1f)",
-            NSStringFromClass([g_appZoomHost class]), g_cfgAppZoomScale,
-            g_cfgAppZoomDur, g_cfgAppZoomDamp, g_cfgAppZoomStiff,
-            g_cfgAppZoomMassV);
+            NSStringFromClass([g_appZoomHost class]), scale,
+            g_cfgAppZoomDur, g_appZoomHostPivot.x, g_appZoomHostPivot.y,
+            (int)g_appZoomHostNormalTransition,
+            (int)g_appZoomHostClosing,
+            g_cfgAppZoomDamp, g_cfgAppZoomStiff, g_cfgAppZoomMassV);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                     (int64_t)((g_cfgAppZoomDur + 0.08) * NSEC_PER_SEC)),
@@ -2023,10 +2326,76 @@ static void w26_appZoomHostAnimate(void) {
             [g_appZoomHost.layer removeAnimationForKey:@"wave26.appzoom.host"];
             w26_log(@"[appzoom:host] done");
         }
+        if (g_appZoomHostNormalTransition) {
+            g_normalAppTransitionArmed = NO;
+            g_normalAppTransitionPlayed = g_appZoomHostClosing;
+            if (g_appZoomHostClosing) g_normalAppBundleID = nil;
+        }
         g_appZoomHostPrepared = NO;
         g_appZoomHost = nil;
         g_appZoomHostCycle = 0;
+        g_appZoomHostNormalTransition = NO;
+        g_appZoomHostClosing = NO;
     });
+}
+
+static void w26_normalAppTransitionAttempt(int attempt, uint64_t token) {
+    if (token != g_normalAppTransitionToken ||
+        !g_normalAppTransitionArmed || g_normalAppTransitionPlayed ||
+        g_onLockScreen ||
+        (g_appMeshNativeSurfaceObserved && !g_normalAppTransitionClosing)) return;
+
+    BOOL closing = g_normalAppTransitionClosing;
+    if (!closing) {
+        NSString *frontmost = w26_frontmostBundleID();
+        if (!frontmost.length ||
+            [frontmost isEqualToString:@"com.apple.springboard"] ||
+            [frontmost hasPrefix:@"SB"]) {
+            if (attempt < 20) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)(kW26RetryInterval * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    w26_normalAppTransitionAttempt(attempt + 1, token);
+                });
+            } else {
+                g_normalAppTransitionArmed = NO;
+                g_normalAppTransitionPlayed = YES;
+                w26_log(@"[appzoom:host] normal open did not reach an app");
+            }
+            return;
+        }
+        g_normalAppBundleID = [frontmost copy];
+    }
+
+    if (!g_normalAppBundleID.length) {
+        g_normalAppTransitionArmed = NO;
+        g_normalAppTransitionPlayed = YES;
+        return;
+    }
+    g_appZoomBundleID = [g_normalAppBundleID copy];
+
+    if (!w26_appZoomHostPrepare()) {
+        if (attempt == 0 || attempt == 5 || attempt == 10 || attempt == 19) {
+            w26_log(@"[appzoom:host] normal %@ host not found retry=%d",
+                    closing ? @"close" : @"open", attempt);
+        }
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                            (int64_t)(kW26RetryInterval * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                w26_normalAppTransitionAttempt(attempt + 1, token);
+            });
+        } else {
+            g_normalAppTransitionArmed = NO;
+            g_normalAppTransitionPlayed = YES;
+            w26_log(@"[appzoom:host] normal %@ unavailable; native path kept",
+                    closing ? @"close" : @"open");
+        }
+        return;
+    }
+
+    g_normalAppTransitionPlayed = YES;
+    w26_appZoomHostAnimate();
 }
 
 static void w26_appZoomHostAttempt(int attempt, uint64_t cycle) {
@@ -2618,6 +2987,27 @@ static void w26_presProgressReached(double progress) {
         /* Readiness signal only - never an independent unlock trigger. */
         w26_requestWaveCheck("progress");
     } else {
+        /* A normal app close also drives the home presentation below 1.0.
+         * Reuse the last tapped app anchor and animate its live host toward
+         * that icon.  This branch is completely outside the unlock state
+         * machine: lock/NC still use the existing wave path. */
+        if (!g_normalAppTransitionArmed && !g_normalAppTransitionPlayed &&
+            !g_appZoomFlow && !g_onLockScreen && g_normalAppBundleID.length) {
+            NSString *frontmost = w26_frontmostBundleID();
+            if (!frontmost.length ||
+                [frontmost isEqualToString:@"com.apple.springboard"] ||
+                [frontmost hasPrefix:@"SB"]) {
+                g_normalAppTransitionArmed = YES;
+                g_normalAppTransitionClosing = YES;
+                g_appMeshNativeSurfaceObserved = NO;
+                g_normalAppTransitionToken++;
+                uint64_t token = g_normalAppTransitionToken;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    w26_normalAppTransitionAttempt(0, token);
+                });
+            }
+        }
+
         if (g_presComplete) {
             /* Progress just left 1.0: SpringBoard is condensing the grid
              * again for a brand-new pull-down (or the same one bouncing).

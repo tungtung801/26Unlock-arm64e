@@ -28,6 +28,8 @@
 	<true/>
 	<key>AppZoomHostFallback</key>
 	<false/>
+	<key>AppZoomLaunchScale</key>
+	<real>0.14</real>
 	<key>AppZoomMesh</key>
 	<true/>
 	<key>AppZoomMeshOpeningMask</key>
