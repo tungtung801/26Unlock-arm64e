@@ -14,6 +14,7 @@ static NSString * const kKeyScale = @"wave26.scale";
  * icons still travel the same distance on screen.  1.0 == no compensation. */
 extern double W26ScaleComp;
 extern double W26WaveSpeed;
+extern double W26DockSpeed;
 extern double W26DockTravel;     /* pt the dock starts below its home      */
 extern double W26DockStiffness;  /* binary: 115 - too slow next to the icons*/
 extern double W26DockDamping;    /* binary: 22                             */
@@ -363,6 +364,8 @@ static const CGFloat kSpringMass = 1.5;
     double stiffness = W26DockStiffness > 1.0  ? W26DockStiffness : 200.0;
     double damping   = W26DockDamping   > 1.0  ? W26DockDamping   : 28.0;
     double mass      = W26DockMass      > 0.05 ? W26DockMass      : 1.0;
+    double speed     = (W26DockSpeed >= 0.50 && W26DockSpeed <= 2.00)
+                     ? W26DockSpeed : 1.0;
 
     double scale = (W26ScaleComp > 0.2 && W26ScaleComp < 5.0) ? W26ScaleComp : 1.0;
 
@@ -391,6 +394,7 @@ static const CGFloat kSpringMass = 1.5;
     animation.beginTime = beginTime;
     animation.fillMode = kCAFillModeBackwards;
     animation.removedOnCompletion = YES;
+    animation.speed = speed;
 
     [layer addAnimation:animation forKey:kKeyDock];
 

@@ -18,6 +18,8 @@
 	<true/>
 	<key>WaveSpeed</key>
 	<real>1.10</real>
+	<key>DockUnlockSpeed</key>
+	<real>1.10</real>
 	<key>AppZoom</key>
 	<true/>
 	<key>AppZoomDirectHost</key>

@@ -127,12 +127,14 @@ static double g_cfgGridMin     = 0.50;  /* min bbox width / screen width      */
 static BOOL   g_cfgScaleComp   = YES;   /* keep travel constant when scaled   */
 static double g_cfgGuard       = 0.60;  /* keep killing competing animations  */
 static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
+static double g_cfgDockUnlockSpeed = 1.10; /* unlock dock only; NC stays at 1.0 */
 
 /* Read by WaveEngine.m.  W26ScaleComp = the ancestor scale the wave offsets
  * are divided by so the motion keeps its on-screen size.  The dock spring is
  * tunable at runtime through 26Unlock.plist - no rebuild needed. */
 double W26ScaleComp = 1.0;
 double W26WaveSpeed = 1.10;       /* 1.00 = recovered timing; 1.10 = 10% faster */
+double W26DockSpeed = 1.0;        /* set per fire: unlock setting or NC reference */
 double W26DockTravel    = 380.0;   /* pt below home (binary value)          */
 double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, far too slow    */
 double W26DockDamping   = 28.0;    /* binary 22 -> ~3pt bounce; 28 = clean  */
@@ -263,6 +265,11 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(doubleValue)]) {
         double speed = [v doubleValue];
         if (speed >= 0.50 && speed <= 2.00) W26WaveSpeed = speed;
+    }
+    v = [d objectForKey:@"DockUnlockSpeed"];
+    if ([v respondsToSelector:@selector(doubleValue)]) {
+        double speed = [v doubleValue];
+        if (speed >= 0.50 && speed <= 2.00) g_cfgDockUnlockSpeed = speed;
     }
     v = [d objectForKey:@"DockTravel"];
     if ([v respondsToSelector:@selector(doubleValue)]) W26DockTravel    = [v doubleValue];
@@ -1285,6 +1292,9 @@ static void w26_fire(double velocity, int attempt) {
     [g_engine clearIcons];
 
     w26_loadSettings();
+    /* NC is the timing reference.  Only the lock-screen unlock path receives
+     * the small compensation for SpringBoard's concurrent dock reveal. */
+    W26DockSpeed = g_unlockConfirmed ? g_cfgDockUnlockSpeed : 1.0;
     w26_forceHomePresentation();
 
     NSArray *icons = w26_collectIconViews();
@@ -1304,12 +1314,13 @@ static void w26_fire(double velocity, int attempt) {
     g_fireDone = YES;
 
     w26_log(@"fire: +%.2fs after request, +%.2fs after unlock, +%.2fs after cover sheet gone | "
-            @"cfg(delay=%.2f settle=%d scaleComp=%d waveSpeed=%.2f guard=%.2f)",
+            @"cfg(delay=%.2f settle=%d scaleComp=%d waveSpeed=%.2f "
+             @"dockSpeed=%.2f guard=%.2f)",
             (g_requestedAt > 0 ? now - g_requestedAt : -1.0),
             (g_unlockedAt > 0 ? now - g_unlockedAt : -1.0),
             (g_lockScreenDismissed > 0 ? now - g_lockScreenDismissed : -1.0),
             g_cfgUnlockDelay, (int)g_cfgWaitSettle, (int)g_cfgScaleComp,
-            W26WaveSpeed, g_cfgGuard);
+            W26WaveSpeed, W26DockSpeed, g_cfgGuard);
 
     /* ---- grid diagnostics (so a "clumped" wave can be diagnosed) ---- */
     {
