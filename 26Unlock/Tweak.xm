@@ -1087,7 +1087,7 @@ static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
             @"window=%@ windowBounds=%@",
             g_appMeshIconCenter.x, g_appMeshIconCenter.y,
             NSStringFromCGRect(inWindow), NSStringFromClass([window class]),
-            NSStringFromCGRect(window.bounds));
+            NSStringFromCGRect(w26_meshGetBounds(window)));
 }
 
 static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
