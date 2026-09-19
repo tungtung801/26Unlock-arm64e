@@ -39,6 +39,8 @@
 #import <notify.h>
 #import <math.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 
 #import "PrivateHeaders/SBPrivate.h"
 #import "WaveEngine.h"
@@ -130,6 +132,7 @@ static BOOL   g_cfgForcePres   = YES;   /* snap the home screen to 1.0 first  */
  * are divided by so the motion keeps its on-screen size.  The dock spring is
  * tunable at runtime through 26Unlock.plist - no rebuild needed. */
 double W26ScaleComp = 1.0;
+double W26WaveSpeed = 1.10;       /* 1.00 = recovered timing; 1.10 = 10% faster */
 double W26DockTravel    = 380.0;   /* pt below home (binary value)          */
 double W26DockStiffness = 200.0;   /* binary 115 -> ~0.70s, far too slow    */
 double W26DockDamping   = 28.0;    /* binary 22 -> ~3pt bounce; 28 = clean  */
@@ -151,6 +154,37 @@ static BOOL   g_cfgAppZoomEarly  = NO;    /* show the blur while dragging    */
 static BOOL   g_cfgAppZoomBlur   = NO;    /* OFF for now - testing the flicker*/
 static BOOL   g_cfgAppZoomDirect = YES;   /* Path B: animate the live app host */
 static BOOL   g_cfgAppZoomHostFallback = NO; /* never fall back to screen shot */
+
+/* Recovered 26Anim path.  This is separate from the unlock-to-app fallback
+ * above: normal icon launches are driven by SBIconView's live transition
+ * object, not by a screen snapshot or a uniform host scale. */
+static BOOL   g_cfgAppMesh = YES;                 /* AppZoomMesh            */
+static BOOL   g_cfgAppMeshOpeningMask = YES;      /* exact 350-pt branch    */
+static BOOL   g_cfgAppMeshHideIcons = YES;        /* hide home icons on open */
+static BOOL   g_cfgAppMeshLayerFallback = NO;     /* only for older runtimes */
+
+static BOOL      g_appMeshHooksInstalled;
+static BOOL      g_appMeshLoggedUnavailable;
+static CGPoint   g_appMeshIconCenter;
+static BOOL      g_appMeshHasIconCenter;
+static NSHashTable *g_appMeshGrabberViews;         /* weak SBIconView table */
+static const void *g_appMeshDisplayLinkKey = &g_appMeshDisplayLinkKey;
+static const void *g_appMeshSavedCRKey = &g_appMeshSavedCRKey;
+static const void *g_appMeshSavedMTBKey = &g_appMeshSavedMTBKey;
+static const void *g_appMeshSavedCurveKey = &g_appMeshSavedCurveKey;
+static const void *g_appMeshSavedMaskKey = &g_appMeshSavedMaskKey;
+
+static IMP w26_orig_iconSetHighlighted;
+static IMP w26_orig_iconDidMoveToWindow;
+static IMP w26_orig_iconSetTransform3D;
+static IMP w26_orig_iconSetTransformAffine;
+
+static BOOL      g_appMeshObservedTransition;
+static uint64_t  g_appMeshObservedCycle;
+
+static BOOL      w26_installAppMeshHooks(void);
+static void      w26_meshStartForTarget(id target, double scalar);
+static void      w26_meshObserveTransform(id target, double scalar);
 
 static BOOL     g_appZoomFlow;            /* this unlock lands in an app     */
 static BOOL     g_appZoomPlayed;
@@ -217,10 +251,23 @@ static void w26_loadSettings(void) {
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomDirect = [v boolValue];
     v = [d objectForKey:@"AppZoomHostFallback"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomHostFallback = [v boolValue];
+    v = [d objectForKey:@"AppZoomMesh"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppMesh = [v boolValue];
+    v = [d objectForKey:@"AppZoomMeshOpeningMask"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppMeshOpeningMask = [v boolValue];
+    v = [d objectForKey:@"AppZoomMeshHideIcons"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppMeshHideIcons = [v boolValue];
+    v = [d objectForKey:@"AppZoomMeshLayerFallback"];
+    if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppMeshLayerFallback = [v boolValue];
     v = [d objectForKey:@"AppZoomBlur"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomBlur   = [v boolValue];
     v = [d objectForKey:@"AppZoomEarlyBlur"];
     if ([v respondsToSelector:@selector(boolValue)])   g_cfgAppZoomEarly = [v boolValue];
+    v = [d objectForKey:@"WaveSpeed"];
+    if ([v respondsToSelector:@selector(doubleValue)]) {
+        double speed = [v doubleValue];
+        if (speed >= 0.50 && speed <= 2.00) W26WaveSpeed = speed;
+    }
     v = [d objectForKey:@"DockTravel"];
     if ([v respondsToSelector:@selector(doubleValue)]) W26DockTravel    = [v doubleValue];
     v = [d objectForKey:@"DockStiffness"];
@@ -288,6 +335,662 @@ static SEL w26_presSEL;                 /* which selector actually exists   */
 static int w26_presKind;                /* 0 none / 4 no-completion / 5 full */
 static IMP w26_orig_viewWillAppear;
 static IMP w26_orig_viewDidDisappear;
+
+/* ------------------------------------------------------------------ */
+#pragma mark - recovered iOS 26 app-transition mesh
+/* ------------------------------------------------------------------ */
+
+/* These are the private QuartzCore records consumed by
+ * +[CAMeshTransform meshTransformWithVertexCount:vertices:faceCount:faces:
+ * depthNormalization:].  The 26Anim binary uses 25 vertices and 16 quad
+ * faces, not a pair of triangles per cell. */
+typedef struct {
+    CGPoint position;
+    CGPoint texCoord;
+    CGFloat z;
+} W26MeshVertex;
+
+typedef struct {
+    unsigned int indices[4];
+    float w[4];
+} W26MeshFace;
+
+@class W26MeshDriver;
+
+static id w26_meshGetObject(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static CGRect w26_meshGetBounds(id object) {
+    if (!object || ![object respondsToSelector:@selector(bounds)]) return CGRectZero;
+    return ((CGRect (*)(id, SEL))objc_msgSend)(object, @selector(bounds));
+}
+
+static CATransform3D w26_meshGetTransform(id object) {
+    if (!object || ![object respondsToSelector:@selector(transform)]) {
+        return CATransform3DIdentity;
+    }
+    return ((CATransform3D (*)(id, SEL))objc_msgSend)(object, @selector(transform));
+}
+
+static CGFloat w26_meshGetCGFloat(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) return 0.0;
+    return ((CGFloat (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static BOOL w26_meshGetBool(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static void w26_meshSetObject(id object, SEL selector, id value) {
+    if (!object || ![object respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(object, selector, value);
+}
+
+static void w26_meshSetCGFloat(id object, SEL selector, CGFloat value) {
+    if (!object || ![object respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, CGFloat))objc_msgSend)(object, selector, value);
+}
+
+static void w26_meshSetBool(id object, SEL selector, BOOL value) {
+    if (!object || ![object respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(object, selector, value);
+}
+
+static void w26_meshSetTransform(id object, SEL selector, CATransform3D value) {
+    if (!object || ![object respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, CATransform3D))objc_msgSend)(object, selector, value);
+}
+
+static CGPoint w26_meshConvertPoint(id object, CGPoint point, id layer) {
+    SEL selector = sel_registerName("convertPoint:toLayer:");
+    if (!object || ![object respondsToSelector:selector]) return CGPointZero;
+    return ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)(object, selector,
+                                                               point, layer);
+}
+
+static NSArray *w26_meshSublayers(id object) {
+    id value = w26_meshGetObject(object, @selector(sublayers));
+    return [value isKindOfClass:[NSArray class]] ? value : nil;
+}
+
+static id w26_meshDisplayLinkOnChain(id target) {
+    id current = target;
+    for (NSUInteger i = 0; current && i < 16; i++) {
+        id link = objc_getAssociatedObject(current, g_appMeshDisplayLinkKey);
+        if (link) return link;
+        current = w26_meshGetObject(current, @selector(superlayer));
+    }
+    return nil;
+}
+
+/* The recovered helper negates its two direction inputs internally.  Keeping
+ * that odd-looking double negation here makes the call site match the binary:
+ * it passes -storedDirection and the effective vector is storedDirection. */
+static id w26_meshCreateBulgedMesh(CGFloat amplitude, CGFloat inputDX,
+                                   CGFloat inputDY) {
+    Class meshClass = NSClassFromString(@"CAMeshTransform");
+    SEL selector = sel_registerName(
+        "meshTransformWithVertexCount:vertices:faceCount:faces:depthNormalization:");
+    if (!meshClass || ![meshClass respondsToSelector:selector]) return nil;
+
+    W26MeshVertex vertices[25];
+    W26MeshFace faces[16];
+    const CGFloat cap = 0.5175;
+    CGFloat a = MIN(amplitude, cap);
+    CGFloat directionX = -inputDX;
+    CGFloat directionY = -inputDY;
+
+    for (NSUInteger row = 0; row < 5; row++) {
+        for (NSUInteger col = 0; col < 5; col++) {
+            NSUInteger index = row * 5 + col;
+            CGFloat u = (CGFloat)col / 4.0;
+            CGFloat v = (CGFloat)row / 4.0;
+            CGFloat cx = u - 0.5;
+            CGFloat cy = v - 0.5;
+            CGFloat dot = cx * directionX + cy * directionY;
+            CGFloat k = a * dot * (dot < 0.0 ? 1.5 : 0.7);
+
+            vertices[index].position = CGPointMake(u + cx * k, v + cy * k);
+            vertices[index].texCoord = CGPointMake(u, v);
+            vertices[index].z = 0.0;
+        }
+    }
+
+    NSUInteger face = 0;
+    for (NSUInteger row = 0; row < 4; row++) {
+        for (NSUInteger col = 0; col < 4; col++) {
+            unsigned int base = (unsigned int)(row * 5 + col);
+            faces[face].indices[0] = base;
+            faces[face].indices[1] = base + 1;
+            faces[face].indices[2] = base + 6;
+            faces[face].indices[3] = base + 5;
+            faces[face].w[0] = 1.0f;
+            faces[face].w[1] = 1.0f;
+            faces[face].w[2] = 1.0f;
+            faces[face].w[3] = 1.0f;
+            face++;
+        }
+    }
+
+    id (*make)(id, SEL, NSUInteger, const W26MeshVertex *, NSUInteger,
+               const W26MeshFace *, CGFloat) =
+        (id (*)(id, SEL, NSUInteger, const W26MeshVertex *, NSUInteger,
+                const W26MeshFace *, CGFloat))objc_msgSend;
+    return make(meshClass, selector, 25, vertices, 16, faces, 0.0);
+}
+
+static CGPoint w26_meshDirectionForTarget(id target, double scalar) {
+    CGPoint anchor = CGPointZero;
+    BOOL haveAnchor = g_appMeshHasIconCenter &&
+                      g_appMeshIconCenter.x > 0.0 &&
+                      g_appMeshIconCenter.y > 0.0;
+    if (haveAnchor) {
+        anchor = g_appMeshIconCenter;
+    } else if (scalar > 0.05) {
+        id presentation = w26_meshGetObject(target, @selector(presentationLayer));
+        id source = presentation ?: target;
+        CGRect bounds = w26_meshGetBounds(source);
+        CGPoint midpoint = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+        anchor = w26_meshConvertPoint(source, midpoint, nil);
+    }
+
+    if (!isfinite(anchor.x) || !isfinite(anchor.y)) return CGPointZero;
+
+    CGRect screen = [UIScreen mainScreen].bounds;
+    CGFloat halfWidth = screen.size.width * 0.5;
+    CGFloat halfHeight = screen.size.height * 0.5;
+    if (halfWidth <= 0.0 || halfHeight <= 0.0) return CGPointZero;
+
+    CGPoint result = CGPointMake((anchor.x - CGRectGetMidX(screen)) / halfWidth,
+                                 (anchor.y - CGRectGetMidY(screen)) / halfHeight);
+    CGFloat length = hypot(result.x, result.y);
+    if (length > 0.05) {
+        result.x /= length;
+        result.y /= length;
+    }
+    return result;
+}
+
+static void w26_meshSaveOpeningSublayerState(id sublayer) {
+    if (!sublayer) return;
+
+    if (!objc_getAssociatedObject(sublayer, g_appMeshSavedCRKey)) {
+        NSNumber *radius = nil;
+        if ([sublayer respondsToSelector:@selector(cornerRadius)]) {
+            radius = @(w26_meshGetCGFloat(sublayer, @selector(cornerRadius)));
+        }
+        if (radius) {
+            objc_setAssociatedObject(sublayer, g_appMeshSavedCRKey, radius,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        NSNumber *masks = nil;
+        if ([sublayer respondsToSelector:@selector(masksToBounds)]) {
+            masks = @(w26_meshGetBool(sublayer, @selector(masksToBounds)));
+        }
+        if (masks) {
+            objc_setAssociatedObject(sublayer, g_appMeshSavedMTBKey, masks,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        SEL curveSEL = sel_registerName("cornerCurve");
+        id curve = w26_meshGetObject(sublayer, curveSEL);
+        objc_setAssociatedObject(sublayer, g_appMeshSavedCurveKey,
+                                 curve ?: [NSNull null],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void w26_meshApplyOpeningSublayers(id target, CGFloat scalar,
+                                          CGFloat progress,
+                                          CGFloat savedTargetRadius) {
+    NSArray *sublayers = w26_meshSublayers(target);
+    if (!sublayers) return;
+
+    CGFloat radius = savedTargetRadius +
+                     (scalar - progress) * (350.0 - savedTargetRadius);
+    if (progress > 1.0) radius = savedTargetRadius;
+
+    SEL curveSEL = sel_registerName("setCornerCurve:");
+    id continuous = @"continuous";
+    for (id sublayer in sublayers) {
+        w26_meshSaveOpeningSublayerState(sublayer);
+        w26_meshSetObject(sublayer, curveSEL, continuous);
+        w26_meshSetBool(sublayer, @selector(setMasksToBounds:), YES);
+        w26_meshSetCGFloat(sublayer, @selector(setCornerRadius:), radius);
+    }
+
+    /* The target itself carries the same clipping state in the recovered
+     * branch.  Keeping this explicit is important: it is also the narrowed
+     * source of the reported top-edge distortion. */
+    w26_meshSetObject(target, curveSEL, continuous);
+    w26_meshSetBool(target, @selector(setMasksToBounds:), YES);
+    w26_meshSetCGFloat(target, @selector(setCornerRadius:), radius);
+}
+
+static void w26_meshRestoreOpeningSublayers(id target) {
+    NSArray *sublayers = w26_meshSublayers(target);
+    for (id sublayer in sublayers) {
+        NSNumber *radius = objc_getAssociatedObject(sublayer, g_appMeshSavedCRKey);
+        NSNumber *masks = objc_getAssociatedObject(sublayer, g_appMeshSavedMTBKey);
+        id curve = objc_getAssociatedObject(sublayer, g_appMeshSavedCurveKey);
+
+        if (radius) w26_meshSetCGFloat(sublayer, @selector(setCornerRadius:),
+                                       radius.doubleValue);
+        if (masks) w26_meshSetBool(sublayer, @selector(setMasksToBounds:),
+                                   masks.boolValue);
+        if (curve) {
+            w26_meshSetObject(sublayer, @selector(setCornerCurve:),
+                              curve == [NSNull null] ? nil : curve);
+        }
+
+        objc_setAssociatedObject(sublayer, g_appMeshSavedCRKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sublayer, g_appMeshSavedMTBKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sublayer, g_appMeshSavedCurveKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+@interface W26MeshDriver : NSObject
+@property(nonatomic, weak) id targetLayer;
+@property(nonatomic, weak) CADisplayLink *displayLink;
+@property(nonatomic) BOOL active;
+@property(nonatomic) BOOL opening;
+@property(nonatomic) BOOL savedTargetState;
+@property(nonatomic) BOOL savedTargetMasks;
+@property(nonatomic) CGFloat savedTargetRadius;
+@property(nonatomic, strong) id savedTargetCurve;
+@property(nonatomic, strong) id savedTargetMask;
+@property(nonatomic) CGFloat directionX;
+@property(nonatomic) CGFloat directionY;
+@property(nonatomic) CGFloat state;
+@property(nonatomic) NSUInteger holdCounter;
+- (instancetype)initWithLayer:(id)layer;
+- (void)prepareForTransition:(id)target scalar:(CGFloat)scalar;
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation W26MeshDriver
+
+- (instancetype)initWithLayer:(id)layer {
+    self = [super init];
+    if (self) {
+        _targetLayer = layer;
+        _state = 0.0;
+        _holdCounter = 0;
+    }
+    return self;
+}
+
+- (void)prepareForTransition:(id)target scalar:(CGFloat)scalar {
+    self.active = YES;
+    self.opening = (scalar < 0.5);
+    /* Opening starts at the icon-sized aperture and expands; closing starts
+     * full-size and contracts.  This is the recovered ±0.15 state envelope. */
+    self.state = self.opening ? 1.0 : 0.0;
+    self.holdCounter = 0;
+
+    self.savedTargetState = [target respondsToSelector:@selector(cornerRadius)];
+    if (self.savedTargetState) {
+        self.savedTargetRadius = w26_meshGetCGFloat(target, @selector(cornerRadius));
+    }
+    self.savedTargetMasks = [target respondsToSelector:@selector(masksToBounds)];
+    if (self.savedTargetMasks) {
+        self.savedTargetMasks = w26_meshGetBool(target, @selector(masksToBounds));
+    }
+
+    SEL curveSEL = sel_registerName("cornerCurve");
+    self.savedTargetCurve = w26_meshGetObject(target, curveSEL) ?: [NSNull null];
+
+    id mask = w26_meshGetObject(target, @selector(mask));
+    id maskName = w26_meshGetObject(mask, @selector(name));
+    if ([maskName isKindOfClass:[NSString class]] &&
+        [maskName isEqualToString:@"Anim26Mask"]) {
+        self.savedTargetMask = mask;
+        w26_meshSetObject(target, @selector(setMask:), nil);
+    }
+
+    CGPoint direction = w26_meshDirectionForTarget(target, scalar);
+    self.directionX = direction.x;
+    self.directionY = direction.y;
+
+    w26_log(@"[appmesh] begin %@ scalar=%.3f opening=%d anchor=(%.1f,%.1f) "
+            @"dir=(%.3f,%.3f)", NSStringFromClass([target class]), scalar,
+            (int)self.opening, g_appMeshIconCenter.x, g_appMeshIconCenter.y,
+            self.directionX, self.directionY);
+}
+
+- (void)restoreTrackedIcons {
+    if (!g_appMeshGrabberViews) return;
+    for (id view in [g_appMeshGrabberViews allObjects]) {
+        if ([view respondsToSelector:@selector(setAlpha:)]) {
+            ((void (*)(id, SEL, CGFloat))objc_msgSend)(view,
+                                                        @selector(setAlpha:), 1.0);
+        }
+    }
+}
+
+- (void)cleanup {
+    id target = self.targetLayer;
+    CADisplayLink *link = self.displayLink;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (target) {
+        w26_meshSetObject(target, @selector(setMeshTransform:), nil);
+        w26_meshSetTransform(target, @selector(setSublayerTransform:),
+                             CATransform3DIdentity);
+        w26_meshSetBool(target, sel_registerName("setShouldRasterize:"), NO);
+
+        if (self.savedTargetState) {
+            w26_meshSetCGFloat(target, @selector(setCornerRadius:),
+                               self.savedTargetRadius);
+        }
+        if ([target respondsToSelector:@selector(setMasksToBounds:)] &&
+            self.savedTargetMasks) {
+            /* savedTargetMasks is also the original value; see the separate
+             * flag below for the case where it was NO. */
+        }
+        if ([target respondsToSelector:@selector(setMasksToBounds:)]) {
+            /* The binary restores the saved BOOL, including NO.  The ivar is
+             * split below so a false saved value is not lost to BOOL typing. */
+            w26_meshSetBool(target, @selector(setMasksToBounds:),
+                            self.savedTargetMasks);
+        }
+        if (self.savedTargetCurve) {
+            w26_meshSetObject(target, @selector(setCornerCurve:),
+                              self.savedTargetCurve == [NSNull null]
+                              ? nil : self.savedTargetCurve);
+        }
+        if (self.savedTargetMask) {
+            w26_meshSetObject(target, @selector(setMask:), self.savedTargetMask);
+        }
+        w26_meshRestoreOpeningSublayers(target);
+    }
+    [CATransaction commit];
+
+    [self restoreTrackedIcons];
+    if (link) [link invalidate];
+    if (target && objc_getAssociatedObject(target, g_appMeshDisplayLinkKey) == link) {
+        objc_setAssociatedObject(target, g_appMeshDisplayLinkKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    self.active = NO;
+    self.targetLayer = nil;
+    self.displayLink = nil;
+    self.directionX = 0.0;
+    self.directionY = 0.0;
+    g_appMeshHasIconCenter = NO;
+    g_appMeshObservedTransition = NO;
+}
+
+- (void)tick:(CADisplayLink *)link {
+    id target = self.targetLayer;
+    if (!target) {
+        [link invalidate];
+        self.displayLink = nil;
+        return;
+    }
+
+    id presentation = w26_meshGetObject(target, @selector(presentationLayer));
+    id source = presentation ?: target;
+    CATransform3D transform = w26_meshGetTransform(source);
+    CGFloat scalar = transform.m11;
+    if (!isfinite(scalar)) {
+        [self cleanup];
+        return;
+    }
+
+    if (!self.active) {
+        if (!(scalar > 0.01 && scalar < 0.995)) return;
+        [self prepareForTransition:target scalar:scalar];
+    } else if (scalar <= 0.01 || scalar >= 0.995) {
+        [self cleanup];
+        return;
+    }
+
+    CGFloat progress = (scalar - 0.05) / 0.94;
+    if (progress < 0.0) progress = 0.0;
+
+    if (self.opening) {
+        self.state = MAX(0.0, self.state - 0.15);
+    } else {
+        self.state = MIN(1.0, self.state + 0.15);
+    }
+
+    CGFloat phase = progress * (CGFloat)M_PI;
+    CGFloat bulge = 0.25 * sin(phase) * self.state;
+    if (!isfinite(bulge) || bulge < 0.001) {
+        [self cleanup];
+        return;
+    }
+
+    id mesh = w26_meshCreateBulgedMesh(bulge, -self.directionX,
+                                       -self.directionY);
+    if (!mesh) {
+        [self cleanup];
+        return;
+    }
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    w26_meshSetObject(target, @selector(setMeshTransform:), mesh);
+    CGFloat scale = MAX(0.1, 1.0 - 1.2 * self.state);
+    w26_meshSetTransform(target, @selector(setSublayerTransform:),
+                         CATransform3DMakeScale(scale, scale, 1.0));
+    w26_meshSetBool(target, sel_registerName("setShouldRasterize:"), YES);
+
+    if (self.opening && g_cfgAppMeshOpeningMask) {
+        w26_meshApplyOpeningSublayers(target, scalar, progress,
+                                      self.savedTargetRadius);
+    }
+    [CATransaction commit];
+
+    if (self.opening && g_cfgAppMeshHideIcons && g_appMeshGrabberViews) {
+        for (id view in [g_appMeshGrabberViews allObjects]) {
+            if ([view respondsToSelector:@selector(setAlpha:)]) {
+                ((void (*)(id, SEL, CGFloat))objc_msgSend)(view,
+                                                            @selector(setAlpha:),
+                                                            0.0);
+            }
+        }
+    }
+}
+
+@end
+
+static id w26_meshTargetForObject(id object) {
+    if (!object) return nil;
+
+    SEL meshSEL = @selector(setMeshTransform:);
+    SEL sublayerSEL = @selector(setSublayerTransform:);
+    if ([object respondsToSelector:meshSEL] &&
+        [object respondsToSelector:sublayerSEL] &&
+        [object respondsToSelector:@selector(presentationLayer)]) {
+        return object;
+    }
+
+    if (g_cfgAppMeshLayerFallback && [object respondsToSelector:@selector(layer)]) {
+        id layer = w26_meshGetObject(object, @selector(layer));
+        if ([layer respondsToSelector:meshSEL] &&
+            [layer respondsToSelector:sublayerSEL] &&
+            [layer respondsToSelector:@selector(presentationLayer)]) {
+            return layer;
+        }
+    }
+    return nil;
+}
+
+static BOOL w26_meshDelegateIsEligible(id object) {
+    id delegate = w26_meshGetObject(object, @selector(delegate));
+    if (!delegate) return NO;
+
+    Class allowed[3] = {
+        NSClassFromString(@"SBCrossfadeView"),
+        NSClassFromString(@"SBFullscreenZoomView"),
+        NSClassFromString(@"SBReusableSnapshotItemContainer")
+    };
+    BOOL match = NO;
+    for (NSUInteger i = 0; i < 3; i++) {
+        if (allowed[i] && ([delegate isKindOfClass:allowed[i]] ||
+                           [delegate class] == allowed[i])) {
+            match = YES;
+            break;
+        }
+    }
+    return match;
+}
+
+static void w26_meshStartForTarget(id target, double scalar) {
+    if (!target || !g_cfgAppZoom || !g_cfgAppMesh) return;
+    w26_loadSettings();
+    if (!g_cfgAppZoom || !g_cfgAppMesh) return;
+
+    if (!NSClassFromString(@"CAMeshTransform")) {
+        if (!g_appMeshLoggedUnavailable) {
+            g_appMeshLoggedUnavailable = YES;
+            w26_log(@"[appmesh] CAMeshTransform unavailable; hook stays inert on this iOS");
+        }
+        return;
+    }
+
+    id existing = w26_meshDisplayLinkOnChain(target);
+    if (existing) return;
+
+    W26MeshDriver *driver = [[W26MeshDriver alloc] initWithLayer:target];
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:driver
+                                                        selector:@selector(tick:)];
+    if (!link) return;
+
+    driver.displayLink = link;
+    objc_setAssociatedObject(target, g_appMeshDisplayLinkKey, link,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if ([link respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
+        NSInteger fps = [UIScreen mainScreen].maximumFramesPerSecond;
+        if (fps < 60) fps = 60;
+        if (fps > 120) fps = 120;
+        link.preferredFramesPerSecond = fps;
+    }
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    g_appMeshObservedTransition = YES;
+    w26_log(@"[appmesh] display link installed target=%@ scalar=%.3f",
+            NSStringFromClass([target class]), scalar);
+}
+
+static void w26_meshObserveTransform(id object, double scalar) {
+    if (!g_cfgAppZoom || !g_cfgAppMesh || !object) return;
+    if (!w26_meshDelegateIsEligible(object)) return;
+
+    CGRect bounds = w26_meshGetBounds(object);
+    if (bounds.size.width <= 200.0 || bounds.size.height <= 400.0) return;
+
+    id target = w26_meshTargetForObject(object);
+    if (!target) return;
+    w26_meshStartForTarget(target, scalar);
+}
+
+static void w26_iconSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
+    if (w26_orig_iconSetHighlighted) {
+        ((void (*)(id, SEL, BOOL))w26_orig_iconSetHighlighted)(self, _cmd,
+                                                               highlighted);
+    }
+    if (!highlighted || !g_cfgAppZoom || !g_cfgAppMesh) return;
+
+    id window = w26_meshGetObject(self, @selector(window));
+    if (!window || ![self respondsToSelector:@selector(convertRect:toView:)]) return;
+    CGRect bounds = w26_meshGetBounds(self);
+    CGRect inWindow = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(
+        self, @selector(convertRect:toView:), bounds, window);
+    g_appMeshIconCenter = CGPointMake(CGRectGetMidX(inWindow),
+                                      CGRectGetMidY(inWindow));
+    g_appMeshHasIconCenter = YES;
+    w26_log(@"[appmesh] highlighted anchor=(%.1f,%.1f) window=%@",
+            g_appMeshIconCenter.x, g_appMeshIconCenter.y,
+            NSStringFromClass([window class]));
+}
+
+static void w26_iconDidMoveToWindow(id self, SEL _cmd) {
+    if (w26_orig_iconDidMoveToWindow) {
+        ((void (*)(id, SEL))w26_orig_iconDidMoveToWindow)(self, _cmd);
+    }
+    if (!g_appMeshGrabberViews) {
+        g_appMeshGrabberViews = [NSHashTable weakObjectsHashTable];
+    }
+    id window = w26_meshGetObject(self, @selector(window));
+    if (window) [g_appMeshGrabberViews addObject:self];
+}
+
+static void w26_iconSetTransform3D(id self, SEL _cmd, CATransform3D transform) {
+    if (w26_orig_iconSetTransform3D) {
+        ((void (*)(id, SEL, CATransform3D))w26_orig_iconSetTransform3D)(
+            self, _cmd, transform);
+    }
+    w26_meshObserveTransform(self, transform.m11);
+}
+
+static void w26_iconSetTransformAffine(id self, SEL _cmd,
+                                       CGAffineTransform transform) {
+    if (w26_orig_iconSetTransformAffine) {
+        ((void (*)(id, SEL, CGAffineTransform))w26_orig_iconSetTransformAffine)(
+            self, _cmd, transform);
+    }
+    w26_meshObserveTransform(self, transform.a);
+}
+
+static BOOL w26_installAppMeshHooks(void) {
+    if (!g_iconClass) g_iconClass = NSClassFromString(@"SBIconView");
+    Class cls = g_iconClass;
+    if (!cls) {
+        w26_log(@"[appmesh] SBIconView unavailable");
+        return NO;
+    }
+
+    BOOL highlighted = w26_swizzle(cls, @selector(setHighlighted:),
+                                   (IMP)w26_iconSetHighlighted,
+                                   &w26_orig_iconSetHighlighted);
+    BOOL moved = w26_swizzle(cls, @selector(didMoveToWindow),
+                             (IMP)w26_iconDidMoveToWindow,
+                             &w26_orig_iconDidMoveToWindow);
+
+    Method transformMethod = class_getInstanceMethod(cls, @selector(setTransform:));
+    BOOL transform = NO;
+    if (transformMethod && method_getNumberOfArguments(transformMethod) == 3) {
+        char *argType = method_copyArgumentType(transformMethod, 2);
+        const char *encoding = argType ?: "";
+        NSUInteger doubleCount = 0;
+        for (const char *p = encoding; *p; p++) {
+            if (*p == 'd') doubleCount++;
+        }
+
+        if (strstr(encoding, "CATransform3D") || doubleCount >= 12) {
+            transform = w26_swizzle(cls, @selector(setTransform:),
+                                    (IMP)w26_iconSetTransform3D,
+                                    &w26_orig_iconSetTransform3D);
+            w26_log(@"[appmesh] SBIconView setTransform: ABI=CATransform3D");
+        } else if (strstr(encoding, "CGAffineTransform") || doubleCount >= 4) {
+            transform = w26_swizzle(cls, @selector(setTransform:),
+                                    (IMP)w26_iconSetTransformAffine,
+                                    &w26_orig_iconSetTransformAffine);
+            w26_log(@"[appmesh] SBIconView setTransform: ABI=CGAffineTransform");
+        } else {
+            w26_log(@"[appmesh] setTransform: ABI not recognized (%s)", encoding);
+        }
+        if (argType) free(argType);
+    }
+
+    g_appMeshHooksInstalled = highlighted && moved && transform;
+    w26_log(@"[appmesh] hooks highlighted=%d moved=%d transform=%d delegates="
+            @"SBCrossfadeView/SBFullscreenZoomView/SBReusableSnapshotItemContainer",
+            (int)highlighted, (int)moved, (int)transform);
+    return g_appMeshHooksInstalled;
+}
 
 /* ------------------------------------------------------------------ */
 #pragma mark - view helpers
@@ -607,11 +1310,12 @@ static void w26_fire(double velocity, int attempt) {
     g_fireDone = YES;
 
     w26_log(@"fire: +%.2fs after request, +%.2fs after unlock, +%.2fs after cover sheet gone | "
-            @"cfg(delay=%.2f settle=%d scaleComp=%d guard=%.2f)",
+            @"cfg(delay=%.2f settle=%d scaleComp=%d waveSpeed=%.2f guard=%.2f)",
             (g_requestedAt > 0 ? now - g_requestedAt : -1.0),
             (g_unlockedAt > 0 ? now - g_unlockedAt : -1.0),
             (g_lockScreenDismissed > 0 ? now - g_lockScreenDismissed : -1.0),
-            g_cfgUnlockDelay, (int)g_cfgWaitSettle, (int)g_cfgScaleComp, g_cfgGuard);
+            g_cfgUnlockDelay, (int)g_cfgWaitSettle, (int)g_cfgScaleComp,
+            W26WaveSpeed, g_cfgGuard);
 
     /* ---- grid diagnostics (so a "clumped" wave can be diagnosed) ---- */
     {
@@ -1882,6 +2586,7 @@ static void w26_installHooks(void) {
                         (IMP)w26_shouldAnimateIconLaunch,
                         &w26_orig_shouldAnimateIconLaunch));
     w26_hookPresentationProgress(iconController);
+    w26_installAppMeshHooks();
 
     Class coverSheet = NSClassFromString(@"SBCoverSheetViewController");
     w26_log(@"hook SBCoverSheetViewController viewWillAppear: = %d",
@@ -1940,6 +2645,7 @@ static void w26_init(void) {
     g_iconClass = NSClassFromString(@"SBIconView");
     g_dockClass = NSClassFromString(@"SBDockView");
     g_haveCoverClass = (NSClassFromString(@"SBCoverSheetViewController") != nil);
+    w26_loadSettings();
 
     g_engine = [WaveEngine new];
 

@@ -16,11 +16,21 @@
 	<true/>
 	<key>ScaleComp</key>
 	<true/>
+	<key>WaveSpeed</key>
+	<real>1.10</real>
 	<key>AppZoom</key>
 	<true/>
 	<key>AppZoomDirectHost</key>
 	<true/>
 	<key>AppZoomHostFallback</key>
+	<false/>
+	<key>AppZoomMesh</key>
+	<true/>
+	<key>AppZoomMeshOpeningMask</key>
+	<true/>
+	<key>AppZoomMeshHideIcons</key>
+	<true/>
+	<key>AppZoomMeshLayerFallback</key>
 	<false/>
 	<key>AppZoomScale</key>
 	<real>1.20</real>

@@ -13,6 +13,7 @@ static NSString * const kKeyScale = @"wave26.scale";
  * screen (unlock transition) every offset must be divided by that scale so the
  * icons still travel the same distance on screen.  1.0 == no compensation. */
 extern double W26ScaleComp;
+extern double W26WaveSpeed;
 extern double W26DockTravel;     /* pt the dock starts below its home      */
 extern double W26DockStiffness;  /* binary: 115 - too slow next to the icons*/
 extern double W26DockDamping;    /* binary: 22                             */
@@ -207,6 +208,8 @@ static const CGFloat kSpringMass = 1.5;
                              pullVelocity:pullVelocity];
     double stiffness = [self stiffnessForIcon:icon];
     double initialVelocity = [self initialVelocityForIcon:icon];
+    double waveSpeed = (W26WaveSpeed >= 0.50 && W26WaveSpeed <= 2.00)
+                     ? W26WaveSpeed : 1.0;
 
     CGPoint original = layer.position;
 
@@ -308,6 +311,9 @@ static const CGFloat kSpringMass = 1.5;
     position.beginTime = beginTime;
     position.fillMode = kCAFillModeBackwards;
     position.removedOnCompletion = YES;
+    /* Speed up the recovered trajectory without changing its path or spring
+     * constants.  1.10 means the same curve completes about 10% sooner. */
+    position.speed = waveSpeed;
 
     [layer addAnimation:position forKey:kKeyPos];
 
@@ -324,6 +330,7 @@ static const CGFloat kSpringMass = 1.5;
     scale.beginTime = beginTime;
     scale.fillMode = kCAFillModeBackwards;
     scale.removedOnCompletion = YES;
+    scale.speed = waveSpeed;
 
     [layer addAnimation:scale forKey:kKeyScale];
 
