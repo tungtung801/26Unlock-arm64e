@@ -50,6 +50,8 @@
 /* ------------------------------------------------------------------ */
 
 #define W26_LOGFILE "/var/mobile/26Unlock.log"
+#define W26_LOGFILE_MEDIA "/var/mobile/Media/26Unlock.log"
+#define W26_LOGFILE_DOCUMENTS "/var/mobile/Documents/26Unlock.log"
 
 static void w26_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
@@ -62,17 +64,27 @@ static void w26_log(NSString *fmt, ...) {
     NSLog(@"[26Unlock] %@", msg);
 
     @autoreleasepool {
-        NSString *path = @W26_LOGFILE;
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:NULL];
-        if (attrs && [attrs fileSize] > 200 * 1024) {
-            [fm removeItemAtPath:path error:NULL];
-        }
+        NSArray *paths = @[
+            @W26_LOGFILE,
+            @W26_LOGFILE_MEDIA,
+            @W26_LOGFILE_DOCUMENTS
+        ];
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
-        FILE *f = fopen(W26_LOGFILE, "a");
-        if (f) {
+
+        /* /var/mobile itself is not writable in every roothide layout.  Try
+         * the historical location first, then Filza-visible user folders. */
+        for (NSString *path in paths) {
+            NSDictionary *attrs = [fm attributesOfItemAtPath:path error:NULL];
+            if (attrs && [attrs fileSize] > 200 * 1024) {
+                [fm removeItemAtPath:path error:NULL];
+            }
+
+            FILE *f = fopen(path.fileSystemRepresentation, "a");
+            if (!f) continue;
             fputs([line UTF8String], f);
             fclose(f);
+            break;
         }
     }
 }
@@ -160,8 +172,8 @@ static BOOL   g_cfgAppZoomHostFallback = NO; /* never fall back to screen shot *
 /* App-transition fail-safe.  This is intentionally separate from the wave:
  * if SpringBoard restarts before the short boot grace period completes, the
  * next load disables only AppZoom/mesh.  Unlock and NC wave hooks remain on. */
-#define W26_APPTRANSITION_BOOT_FILE @"/var/mobile/26Unlock.apptransition.boot"
-#define W26_APPTRANSITION_SAFE_FILE @"/var/mobile/26Unlock.apptransition.safe"
+#define W26_APPTRANSITION_BOOT_FILE @"/var/mobile/Media/26Unlock.apptransition.boot"
+#define W26_APPTRANSITION_SAFE_FILE @"/var/mobile/Media/26Unlock.apptransition.safe"
 static BOOL g_cfgAppTransitionSafeMode;
 static BOOL g_appTransitionSafeMode;
 static BOOL g_appTransitionSafetyArmed;
@@ -2850,7 +2862,8 @@ static void w26_init(void) {
             g_iconClass ? NSStringFromClass(g_iconClass) : @"MISSING",
             g_dockClass ? NSStringFromClass(g_dockClass) : @"MISSING",
             g_haveCoverClass ? @"YES" : @"MISSING");
-    w26_log(@"log file: " W26_LOGFILE);
+    w26_log(@"log files: " W26_LOGFILE " | " W26_LOGFILE_MEDIA
+            " | " W26_LOGFILE_DOCUMENTS);
 }
 
 __attribute__((constructor))
